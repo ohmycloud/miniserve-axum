@@ -5,6 +5,7 @@ mod errors;
 mod file_utils;
 mod handlers;
 mod listing;
+mod middleware;
 mod render;
 
 pub use args::*;
@@ -14,6 +15,7 @@ pub use errors::*;
 pub use file_utils::*;
 pub use handlers::*;
 pub use listing::*;
+pub use middleware::*;
 pub use render::*;
 
 static STYLESHEET: &str = grass::include!("data/style.scss");

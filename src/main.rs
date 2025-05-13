@@ -1,12 +1,15 @@
 use anyhow::Result;
 use axum::Router;
+use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use log::{error, warn};
 use miniserve_axum::{
-    CliArgs, MiniserveConfig, StartupError, css, favicon, healthcheck, log_error_chain,
+    CliArgs, MiniserveConfig, StartupError, configure_header, css, favicon, healthcheck,
+    log_error_chain,
 };
+use std::iter::from_fn;
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -177,6 +180,7 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .collect::<Vec<_>>();
 
     let app = Router::new()
+        .layer(from_fn_with_state(inside_config.clone(), configure_header))
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
