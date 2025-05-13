@@ -3,8 +3,10 @@ use axum::Router;
 use axum::routing::get;
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
-use log::{error, info, warn};
-use miniserve_axum::{CliArgs, MiniserveConfig, StartupError, healthcheck, log_error_chain};
+use log::{error, warn};
+use miniserve_axum::{
+    CliArgs, MiniserveConfig, StartupError, css, favicon, healthcheck, log_error_chain,
+};
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -12,8 +14,6 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 use tokio::net::TcpListener;
-
-static STYLESHEET: &str = grass::include!("data/style.scss");
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -177,7 +177,9 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .collect::<Vec<_>>();
 
     let app = Router::new()
-        .route("/", get(healthcheck))
+        .route(&inside_config.healthcheck_route, get(healthcheck))
+        .route(&inside_config.favicon_route, get(favicon))
+        .route(&inside_config.css_route, get(css))
         .with_state(inside_config);
 
     let addr = format!("0.0.0.0:{}", 3333);

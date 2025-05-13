@@ -15,3 +15,5 @@ pub use file_utils::*;
 pub use handlers::*;
 pub use listing::*;
 pub use render::*;
+
+static STYLESHEET: &str = grass::include!("data/style.scss");
