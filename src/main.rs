@@ -4,10 +4,11 @@ use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
+use fast_qr::QRBuilder;
 use log::{error, warn};
 use miniserve_axum::{
-    CliArgs, MiniserveConfig, StartupError, configure_header, css, favicon, healthcheck,
-    log_error_chain,
+    CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css, favicon,
+    healthcheck, log_error_chain,
 };
 use std::thread;
 use std::time::Duration;
@@ -187,6 +188,41 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
         .with_state(inside_config);
+
+    println!("Bound to {}", display_sockets.join(", "));
+
+    println!("Serving path {}", path_string.yellow().bold());
+
+    println!(
+        "Available at (non-exhaustive list):\n    {}\n",
+        display_urls
+            .iter()
+            .map(|url| url.green().bold().to_string())
+            .collect::<Vec<_>>()
+            .join("\n    "),
+    );
+
+    // print QR code to terminal
+    if miniserve_config.show_qrcode && io::stdout().is_terminal() {
+        for url in display_urls
+            .iter()
+            .filter(|url| !url.contains("//127.0.0.1:") && !url.contains("//[::1]:"))
+        {
+            match QRBuilder::new(url.clone()).ecl(QR_EC_LEVEL).build() {
+                Ok(qr) => {
+                    println!("QR code for {}:", url.green().bold());
+                    qr.print();
+                }
+                Err(e) => {
+                    error!("Failed to render QR to terminal: {:?}", e);
+                }
+            };
+        }
+    }
+
+    if io::stdout().is_terminal() {
+        println!("Quit by pressing CTRL-C");
+    }
 
     let addr = format!("0.0.0.0:{}", 3333);
     let listener = TcpListener::bind(&addr)

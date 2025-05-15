@@ -40,6 +40,7 @@ clap = { version = "4.5.38", features = [
 clap_complete = "4.5.50"
 clap_mangen = "0.2.26"
 colored = "3.0.0"
+fast_qr = { version = "0.13.0", features = ["svg"] }
 grass = { version = "0.13.4", features = ["macro"], default-features = false }
 hex = "0.4.3"
 httparse = "1.10.1"
