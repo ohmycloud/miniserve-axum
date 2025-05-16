@@ -251,3 +251,9 @@ fn create_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     socket.listen(1024 /* Default backlog */)?;
     Ok(std::net::TcpListener::from(socket))
 }
+
+#[derive(serde::Deserialize, Debug)]
+enum ApiCommand {
+    /// Request the size of a particular directory
+    DirSize(String),
+}
