@@ -234,3 +234,20 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
 
     Ok(())
 }
+
+/// Allows us to set low-level socket options
+///
+/// This mainly used to set `set_only_v6` socket option
+/// to get a consistent behavior across platforms.
+/// see: https://github.com/svenstaro/miniserve/pull/500
+fn create_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024 /* Default backlog */)?;
+    Ok(std::net::TcpListener::from(socket))
+}
