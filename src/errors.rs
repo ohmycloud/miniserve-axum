@@ -103,6 +103,6 @@ impl IntoResponse for RuntimeError {
             E::InvalidHttpRequestError(_) => S::BAD_REQUEST,
             E::RouteNotFoundError(_) => S::NOT_FOUND,
         };
-        self.into_response()
+        res.into_response()
     }
 }
