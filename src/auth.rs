@@ -1,5 +1,9 @@
 use sha2::{Digest, Sha256, Sha512};
 
+pub struct CurrentUser {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// `password` field of `RequiredAuth`
 pub enum RequiredPassword {

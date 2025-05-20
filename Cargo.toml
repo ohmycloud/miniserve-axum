@@ -33,6 +33,9 @@ axum = { version = "0.8.4", features = [
 ] }
 axum-extra = { version = "0.10.1", features = ["multipart"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+bytesize = "2.0.1"
+chrono = "0.4.41"
+chrono-humanize = "0.2.3"
 clap = { version = "4.5.38", features = [
     "derive",
     "cargo",
@@ -52,6 +55,7 @@ httparse = "1.10.1"
 if-addrs = "0.13.4"
 libflate = "2.1.0"
 log = "0.4.27"
+maud = "0.27.0"
 nanoid = "0.4.0"
 port_check = "0.2.1"
 rustls = { version = "0.23.27", features = [

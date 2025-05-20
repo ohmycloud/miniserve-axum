@@ -1,3 +1,4 @@
+mod archive;
 mod args;
 mod auth;
 mod config;
@@ -11,6 +12,7 @@ mod middleware;
 mod render;
 mod webdav_fs;
 
+pub use archive::*;
 pub use args::*;
 pub use auth::*;
 pub use config::*;
