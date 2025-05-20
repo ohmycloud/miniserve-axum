@@ -57,6 +57,7 @@ libflate = "2.1.0"
 log = "0.4.27"
 maud = "0.27.0"
 nanoid = "0.4.0"
+percent-encoding = "2.3.1"
 port_check = "0.2.1"
 rustls = { version = "0.23.27", features = [
     "ring",
@@ -72,6 +73,7 @@ tar = "0.4.44"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7.15", features = ["io"] }
 tower = "0.5.2"
 tower-http = { version = "0.6.4", features = ["full"] }
 zip = "3.0.0"
