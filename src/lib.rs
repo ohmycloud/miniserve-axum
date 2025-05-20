@@ -9,6 +9,7 @@ mod file_utils;
 mod handlers;
 mod listing;
 mod middleware;
+mod pipe;
 mod render;
 mod webdav_fs;
 
@@ -23,6 +24,7 @@ pub use file_utils::*;
 pub use handlers::*;
 pub use listing::*;
 pub use middleware::*;
+pub use pipe::*;
 pub use render::*;
 pub use webdav_fs::*;
 
