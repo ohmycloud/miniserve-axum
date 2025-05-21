@@ -22,6 +22,7 @@ panic = 'abort'
 strip = true
 
 [dependencies]
+alphanumeric-sort = "1.5.3"
 anyhow = "1.0.98"
 async-walkdir = "2.1.0"
 axum = { version = "0.8.4", features = [
@@ -47,6 +48,7 @@ clap = { version = "4.5.38", features = [
 clap_complete = "4.5.50"
 clap_mangen = "0.2.26"
 colored = "3.0.0"
+comrak = { version = "0.39.0", default-features = false }
 dav-server = "0.8.0"
 fast_qr = { version = "0.13.0", features = ["svg"] }
 futures = "0.3.31"
@@ -60,6 +62,7 @@ maud = "0.27.0"
 nanoid = "0.4.0"
 percent-encoding = "2.3.1"
 port_check = "0.2.1"
+regex = "1.11.1"
 rustls = { version = "0.23.27", features = [
     "ring",
     "std",
@@ -74,6 +77,7 @@ tar = "0.4.44"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["io"] }
 tower = "0.5.2"
 tower-http = { version = "0.6.4", features = ["full"] }
