@@ -6,14 +6,11 @@ use axum::{
 };
 use clap::ValueEnum;
 use futures::channel::mpsc;
-use futures::stream::StreamExt;
 use percent_encode_sets::COMPONENT;
 use percent_encoding::{percent_decode_str, utf8_percent_encode};
 use regex::Regex;
 use serde::Deserialize;
 use std::{
-    fs::DirEntry,
-    io,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::SystemTime,
