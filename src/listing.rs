@@ -210,8 +210,6 @@ pub async fn directory_listing(
     headers: HeaderMap,
     Query(query_params): Query<QueryParams>,
     State(config): State<Arc<MiniserveConfig>>,
-    // 添加当前用户信息的扩展，如果需要的话
-    // Extension(current_user): Extension<Option<CurrentUser>>,
 ) -> Response {
     let current_user: Option<CurrentUser> = None; // 从请求中提取用户信息
 
