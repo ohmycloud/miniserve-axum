@@ -14,7 +14,6 @@ mod pipe;
 mod render;
 mod webdav_fs;
 
-pub use app::*;
 pub use archive::*;
 pub use args::*;
 pub use auth::*;

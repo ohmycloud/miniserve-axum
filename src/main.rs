@@ -1,10 +1,11 @@
 use anyhow::Result;
-use axum::routing::{get, post};
+use axum::routing::{get};
 use axum::Router;
 use axum::middleware::from_fn_with_state;
-use axum::extract::{Request, State};
-use axum::http::{StatusCode, Uri};
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, Uri, HeaderValue};
 use axum::response::{Html, IntoResponse, Response};
+use axum::body::Body;
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
@@ -12,24 +13,30 @@ use log::{error, warn};
 use miniserve_axum::{
     CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css, favicon,
     healthcheck, log_error_chain, Entry, EntryType, Breadcrumb, page, ListingQueryParameters,
+    ArchiveMethod, Pipe,
 };
 use std::thread;
 use std::time::Duration;
 use std::{
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
-    sync::Arc,
 };
 use tokio::net::TcpListener;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
+use futures::channel::mpsc;
 use std::path::Path;
 use tokio::fs;
 use bytesize::ByteSize;
-use std::time::SystemTime;
+
+#[derive(serde::Deserialize)]
+struct DownloadQuery {
+    download: Option<ArchiveMethod>,
+}
 
 async fn file_and_directory_handler(
     uri: Uri,
+    Query(download_query): Query<DownloadQuery>,
     State(config): State<MiniserveConfig>,
 ) -> impl IntoResponse {
     let path_str = uri.path();
@@ -70,10 +77,62 @@ async fn file_and_directory_handler(
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read file").into_response(),
         }
     } else if full_path.is_dir() {
-        // Generate proper directory listing using miniserve's render functions
-        match generate_directory_listing(&full_path, &uri, &config).await {
-            Ok(html) => Html(html.into_string()).into_response(),
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read directory").into_response(),
+        // Check if this is a download request
+        if let Some(archive_method) = download_query.download {
+            // Handle archive download
+            if !archive_method.is_enabled(
+                config.tar_enabled,
+                config.tar_gz_enabled,
+                config.zip_enabled,
+            ) {
+                return (StatusCode::FORBIDDEN, "Archive creation is disabled.").into_response();
+            }
+
+            let file_name = format!(
+                "{}.{}",
+                full_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("archive"),
+                archive_method.extension()
+            );
+
+            // Create streaming response
+            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(10);
+            let pipe = Pipe::new(tx);
+
+            // Create archive in background thread
+            let dir_path = full_path.clone();
+            let skip_symlinks = config.no_symlinks;
+            tokio::spawn(async move {
+                if let Err(err) = archive_method.create_archive(dir_path, skip_symlinks, pipe) {
+                    log::error!("Error during archive creation: {:?}", err);
+                }
+            });
+
+            let body = Body::from_stream(rx);
+
+            let mut response = Response::new(body);
+            response.headers_mut().insert(
+                "content-type",
+                HeaderValue::from_str(&archive_method.content_type())
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+            );
+            response.headers_mut().insert(
+                "content-transfer-encoding",
+                HeaderValue::from_static("binary"),
+            );
+            response.headers_mut().insert(
+                "content-disposition",
+                HeaderValue::from_str(&format!("attachment; filename={:?}", file_name)).unwrap(),
+            );
+
+            return response;
+        } else {
+            // Generate directory listing
+            match generate_directory_listing(&full_path, &uri, &config).await {
+                Ok(html) => Html(html.into_string()).into_response(),
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read directory").into_response(),
+            }
         }
     } else {
         (StatusCode::NOT_FOUND, "Not found").into_response()
