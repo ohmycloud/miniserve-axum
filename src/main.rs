@@ -13,7 +13,7 @@ use log::{error, warn};
 use miniserve_axum::{
     CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css, favicon,
     healthcheck, log_error_chain, Entry, EntryType, Breadcrumb, page, ListingQueryParameters,
-    ArchiveMethod, Pipe,
+    ArchiveMethod,
 };
 use std::thread;
 use std::time::Duration;
@@ -24,7 +24,6 @@ use std::{
 use tokio::net::TcpListener;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
-use futures::channel::mpsc;
 use std::path::Path;
 use tokio::fs;
 use bytesize::ByteSize;
@@ -88,6 +87,12 @@ async fn file_and_directory_handler(
                 return (StatusCode::FORBIDDEN, "Archive creation is disabled.").into_response();
             }
 
+            log::info!("Creating {} archive for path: {:?}", archive_method, full_path);
+            log::info!("Full path exists: {}", full_path.exists());
+            log::info!("Full path is_dir: {}", full_path.is_dir());
+            log::info!("Full path file_name: {:?}", full_path.file_name());
+            log::info!("Full path as string: {}", full_path.display());
+            
             let file_name = format!(
                 "{}.{}",
                 full_path.file_name()
@@ -96,37 +101,34 @@ async fn file_and_directory_handler(
                 archive_method.extension()
             );
 
-            // Create streaming response
-            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(10);
-            let pipe = Pipe::new(tx);
-
-            // Create archive in background thread
-            let dir_path = full_path.clone();
-            let skip_symlinks = config.no_symlinks;
-            tokio::spawn(async move {
-                if let Err(err) = archive_method.create_archive(dir_path, skip_symlinks, pipe) {
-                    log::error!("Error during archive creation: {:?}", err);
+            // Create archive synchronously in memory for debugging
+            let mut buffer = Vec::new();
+            match archive_method.create_archive(&full_path, config.no_symlinks, &mut buffer) {
+                Ok(()) => {
+                    log::info!("Archive created successfully! Size: {} bytes", buffer.len());
+                    
+                    let mut response = Response::new(Body::from(buffer));
+                    response.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_str(&archive_method.content_type())
+                            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+                    );
+                    response.headers_mut().insert(
+                        "content-transfer-encoding",
+                        HeaderValue::from_static("binary"),
+                    );
+                    response.headers_mut().insert(
+                        "content-disposition",
+                        HeaderValue::from_str(&format!("attachment; filename={:?}", file_name)).unwrap(),
+                    );
+                    
+                    return response;
                 }
-            });
-
-            let body = Body::from_stream(rx);
-
-            let mut response = Response::new(body);
-            response.headers_mut().insert(
-                "content-type",
-                HeaderValue::from_str(&archive_method.content_type())
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-            );
-            response.headers_mut().insert(
-                "content-transfer-encoding",
-                HeaderValue::from_static("binary"),
-            );
-            response.headers_mut().insert(
-                "content-disposition",
-                HeaderValue::from_str(&format!("attachment; filename={:?}", file_name)).unwrap(),
-            );
-
-            return response;
+                Err(err) => {
+                    log::error!("Archive creation failed: {:?}", err);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Archive creation failed: {}", err)).into_response();
+                }
+            }
         } else {
             // Generate directory listing
             match generate_directory_listing(&full_path, &uri, &config).await {

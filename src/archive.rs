@@ -11,7 +11,7 @@ use zip::{ZipWriter, write};
 use crate::errors::RuntimeError;
 
 /// Available archive methods
-#[derive(Deserialize, Clone, Copy, EnumIter, EnumString, Display)]
+#[derive(Debug, Deserialize, Clone, Copy, EnumIter, EnumString, Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ArchiveMethod {
@@ -119,9 +119,10 @@ fn tar_dir<W>(dir: &Path, skip_symlinks: bool, out: W) -> Result<(), RuntimeErro
 where
     W: std::io::Write,
 {
-    let inner_folder = dir.file_name().ok_or_else(|| {
-        RuntimeError::InvalidPathError("Directory name terminates in \"..\"".to_string())
-    })?;
+    let inner_folder = dir.file_name().unwrap_or_else(|| {
+        // If file_name() returns None (e.g., for root paths), use a default name
+        std::ffi::OsStr::new("archive")
+    });
 
     let directory = inner_folder.to_str().ok_or_else(|| {
         RuntimeError::InvalidPathError(
@@ -204,9 +205,10 @@ where
     let options =
         write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let mut paths_queue: Vec<PathBuf> = vec![directory.to_path_buf()];
-    let zip_root_folder_name = directory.file_name().ok_or_else(|| {
-        RuntimeError::InvalidPathError("Directory name terminates in \"..\"".to_string())
-    })?;
+    let zip_root_folder_name = directory.file_name().unwrap_or_else(|| {
+        // If file_name() returns None (e.g., for root paths), use a default name  
+        std::ffi::OsStr::new("archive")
+    });
 
     let mut zip_writer = ZipWriter::new(out);
     let mut buffer = Vec::new();
@@ -309,9 +311,10 @@ fn zip_dir<W>(dir: &Path, skip_symlinks: bool, out: W) -> Result<(), RuntimeErro
 where
     W: std::io::Write,
 {
-    let inner_folder = dir.file_name().ok_or_else(|| {
-        RuntimeError::InvalidPathError("Directory name terminates in \"..\"".to_string())
-    })?;
+    let inner_folder = dir.file_name().unwrap_or_else(|| {
+        // If file_name() returns None (e.g., for root paths), use a default name
+        std::ffi::OsStr::new("archive")
+    });
 
     inner_folder.to_str().ok_or_else(|| {
         RuntimeError::InvalidPathError(
