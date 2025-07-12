@@ -11,7 +11,7 @@ use fast_qr::QRBuilder;
 use log::{error, warn};
 use miniserve_axum::{
     CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css, favicon,
-    healthcheck, log_error_chain,
+    healthcheck, log_error_chain, Entry, EntryType, Breadcrumb, page, ListingQueryParameters,
 };
 use std::thread;
 use std::time::Duration;
@@ -25,6 +25,8 @@ use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
 use std::path::Path;
 use tokio::fs;
+use bytesize::ByteSize;
+use std::time::SystemTime;
 
 async fn file_and_directory_handler(
     uri: Uri,
@@ -68,36 +70,97 @@ async fn file_and_directory_handler(
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read file").into_response(),
         }
     } else if full_path.is_dir() {
-        // Simple directory listing
-        match fs::read_dir(&full_path).await {
-            Ok(mut entries) => {
-                let mut html = String::from(
-                    r#"<!DOCTYPE html>
-<html>
-<head><title>Directory listing</title></head>
-<body>
-<h1>Directory listing</h1>
-<ul>"#,
-                );
-                
-                while let Some(entry) = entries.next_entry().await.unwrap_or(None) {
-                    let file_name = entry.file_name();
-                    let name = file_name.to_string_lossy();
-                    let href = format!("{}/{}", path_str.trim_end_matches('/'), name);
-                    html.push_str(&format!(
-                        r#"<li><a href="{}">{}</a></li>"#,
-                        href, name
-                    ));
-                }
-                
-                html.push_str("</ul></body></html>");
-                Html(html).into_response()
-            }
+        // Generate proper directory listing using miniserve's render functions
+        match generate_directory_listing(&full_path, &uri, &config).await {
+            Ok(html) => Html(html.into_string()).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read directory").into_response(),
         }
     } else {
         (StatusCode::NOT_FOUND, "Not found").into_response()
     }
+}
+
+async fn generate_directory_listing(
+    dir_path: &Path,
+    uri: &Uri,
+    config: &MiniserveConfig,
+) -> Result<maud::Markup, std::io::Error> {
+    let mut entries = Vec::new();
+    let mut dir_entries = fs::read_dir(dir_path).await?;
+    
+    while let Some(entry) = dir_entries.next_entry().await? {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry.metadata().await.ok();
+        
+        let entry_type = if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            EntryType::Directory
+        } else {
+            EntryType::File
+        };
+        
+        let size = metadata
+            .as_ref()
+            .filter(|m| m.is_file())
+            .map(|m| ByteSize::b(m.len()));
+        
+        let last_modification_date = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok());
+        
+        let link = if uri.path().ends_with('/') {
+            format!("{}{}", uri.path(), file_name)
+        } else {
+            format!("{}/{}", uri.path(), file_name)
+        };
+        
+        entries.push(Entry {
+            name: file_name,
+            entry_type,
+            link,
+            size,
+            last_modification_date,
+            symlink_info: None,
+        });
+    }
+    
+    // Create breadcrumbs
+    let path_components: Vec<&str> = uri.path().trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let mut breadcrumbs = vec![Breadcrumb {
+        name: "Home".to_string(),
+        link: "/".to_string(),
+    }];
+    
+    let mut current_path = String::new();
+    for component in path_components {
+        current_path.push('/');
+        current_path.push_str(component);
+        breadcrumbs.push(Breadcrumb {
+            name: component.to_string(),
+            link: current_path.clone(),
+        });
+    }
+    
+    // Mark the last breadcrumb as current (don't make it a link)
+    if let Some(last) = breadcrumbs.last_mut() {
+        last.link = ".".to_string();
+    }
+    
+    let is_root = uri.path() == "/" || uri.path().is_empty();
+    let encoded_dir = uri.path().to_string();
+    let query_params = ListingQueryParameters::default();
+    
+    // Use the proper miniserve page render function
+    Ok(page(
+        entries,
+        None, // readme
+        uri,
+        is_root,
+        query_params,
+        &breadcrumbs,
+        &encoded_dir,
+        config,
+        None, // current_user
+    ))
 }
 
 fn main() -> Result<()> {
