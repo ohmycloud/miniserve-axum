@@ -1,7 +1,10 @@
 use anyhow::Result;
+use axum::routing::{get, post};
 use axum::Router;
 use axum::middleware::from_fn_with_state;
-use axum::routing::get;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response};
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
@@ -15,9 +18,87 @@ use std::time::Duration;
 use std::{
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
 use tokio::net::TcpListener;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+
+use std::path::Path;
+use tokio::fs;
+
+async fn file_and_directory_handler(
+    uri: Uri,
+    State(config): State<MiniserveConfig>,
+) -> impl IntoResponse {
+    let path_str = uri.path();
+    let decoded_path = percent_encoding::percent_decode_str(path_str)
+        .decode_utf8()
+        .unwrap_or_default();
+    
+    // Remove leading slash and join with served directory
+    let relative_path = decoded_path.strip_prefix('/').unwrap_or(&decoded_path);
+    let full_path = config.path.join(relative_path);
+    
+    if !full_path.exists() {
+        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    }
+    
+    if full_path.is_file() {
+        // Serve file
+        match fs::read(&full_path).await {
+            Ok(contents) => {
+                // Simple content type detection
+                let content_type = if path_str.ends_with(".html") {
+                    "text/html"
+                } else if path_str.ends_with(".css") {
+                    "text/css"
+                } else if path_str.ends_with(".js") {
+                    "application/javascript"
+                } else if path_str.ends_with(".png") {
+                    "image/png"
+                } else if path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") {
+                    "image/jpeg"
+                } else {
+                    "application/octet-stream"
+                };
+                
+                let headers = [(axum::http::header::CONTENT_TYPE, content_type)];
+                (headers, contents).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read file").into_response(),
+        }
+    } else if full_path.is_dir() {
+        // Simple directory listing
+        match fs::read_dir(&full_path).await {
+            Ok(mut entries) => {
+                let mut html = String::from(
+                    r#"<!DOCTYPE html>
+<html>
+<head><title>Directory listing</title></head>
+<body>
+<h1>Directory listing</h1>
+<ul>"#,
+                );
+                
+                while let Some(entry) = entries.next_entry().await.unwrap_or(None) {
+                    let file_name = entry.file_name();
+                    let name = file_name.to_string_lossy();
+                    let href = format!("{}/{}", path_str.trim_end_matches('/'), name);
+                    html.push_str(&format!(
+                        r#"<li><a href="{}">{}</a></li>"#,
+                        href, name
+                    ));
+                }
+                
+                html.push_str("</ul></body></html>");
+                Html(html).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read directory").into_response(),
+        }
+    } else {
+        (StatusCode::NOT_FOUND, "Not found").into_response()
+    }
+}
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -187,6 +268,7 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
+        .fallback(file_and_directory_handler)
         .with_state(inside_config);
 
     println!("Bound to {}", display_sockets.join(", "));
@@ -224,7 +306,7 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         println!("Quit by pressing CTRL-C");
     }
 
-    let addr = format!("0.0.0.0:{}", 3333);
+    let addr = format!("0.0.0.0:{}", miniserve_config.port);
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| StartupError::NetworkError(e.to_string()))?;
