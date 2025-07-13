@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, header},
@@ -14,7 +15,7 @@ pub async fn favicon() -> impl IntoResponse {
     (headers, logo)
 }
 
-pub async fn css(State(inside_config): State<MiniserveConfig>) -> impl IntoResponse {
+pub async fn css(State(inside_config): State<Arc<MiniserveConfig>>) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
     let stylesheet = [

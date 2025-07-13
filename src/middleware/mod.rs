@@ -1,4 +1,5 @@
 use crate::MiniserveConfig;
+use std::sync::Arc;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue},
@@ -7,7 +8,7 @@ use axum::{
 };
 
 pub async fn configure_header(
-    State(state): State<MiniserveConfig>,
+    State(state): State<Arc<MiniserveConfig>>,
     req: Request,
     next: Next,
 ) -> Response {

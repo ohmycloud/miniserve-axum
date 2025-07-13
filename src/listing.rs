@@ -495,8 +495,8 @@ mod renderer {
     use super::*;
 
     pub fn page(
-        entries: Vec<Entry>,
-        readme: Option<(String, String)>,
+        _entries: Vec<Entry>,
+        _readme: Option<(String, String)>,
         abs_uri: &str,
         is_root: bool,
         query_params: QueryParams,

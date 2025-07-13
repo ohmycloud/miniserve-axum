@@ -1,20 +1,21 @@
 use anyhow::Result;
-use axum::routing::{get};
 use axum::Router;
-use axum::middleware::from_fn_with_state;
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, Uri, HeaderValue};
-use axum::response::{Html, IntoResponse, Response};
 use axum::body::Body;
+use axum::extract::{Query, State};
+use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::middleware::from_fn_with_state;
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
 use log::{error, warn};
 use miniserve_axum::{
-    CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css, favicon,
-    healthcheck, log_error_chain, Entry, EntryType, Breadcrumb, page, ListingQueryParameters,
-    ArchiveMethod,
+    ArchiveMethod, Breadcrumb, CliArgs, Entry, EntryType,
+    ListingQueryParameters, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css,
+    favicon, healthcheck, log_error_chain, page,
 };
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -24,33 +25,85 @@ use std::{
 use tokio::net::TcpListener;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
+use bytesize::ByteSize;
 use std::path::Path;
 use tokio::fs;
-use bytesize::ByteSize;
 
 #[derive(serde::Deserialize)]
 struct DownloadQuery {
     download: Option<ArchiveMethod>,
 }
 
+async fn upload_file_handler(
+    State(config): State<Arc<MiniserveConfig>>,
+    headers: axum::http::HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    log::info!("Upload request received!");
+    
+    // For now, upload to the root directory being served
+    let target_dir = &config.path;
+    
+    if !target_dir.exists() || !target_dir.is_dir() {
+        log::error!("Target directory does not exist: {:?}", target_dir);
+        return (StatusCode::BAD_REQUEST, "Target directory not found").into_response();
+    }
+    
+    // Process multipart fields
+    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+        if let Some(filename) = field.file_name() {
+            let filename = filename.to_string();
+            let file_path = target_dir.join(&filename);
+            
+            log::info!("Uploading file: {:?} to {:?}", filename, file_path);
+            
+            // Read the field data
+            let data = match field.bytes().await {
+                Ok(data) => data,
+                Err(e) => {
+                    log::error!("Failed to read upload data: {:?}", e);
+                    return (StatusCode::BAD_REQUEST, "Failed to read upload data").into_response();
+                }
+            };
+            
+            // Write the file
+            if let Err(e) = tokio::fs::write(&file_path, data).await {
+                log::error!("Failed to write file {:?}: {:?}", file_path, e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save file").into_response();
+            }
+            
+            log::info!("Successfully uploaded: {:?}", filename);
+        }
+    }
+    
+    // Get the referer for redirect
+    let return_path = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("/");
+    
+    log::info!("Upload completed, redirecting to: {}", return_path);
+    axum::response::Redirect::to(return_path).into_response()
+}
+
 async fn file_and_directory_handler(
     uri: Uri,
     Query(download_query): Query<DownloadQuery>,
-    State(config): State<MiniserveConfig>,
+    State(config): State<Arc<MiniserveConfig>>,
 ) -> impl IntoResponse {
     let path_str = uri.path();
     let decoded_path = percent_encoding::percent_decode_str(path_str)
         .decode_utf8()
         .unwrap_or_default();
-    
+
     // Remove leading slash and join with served directory
     let relative_path = decoded_path.strip_prefix('/').unwrap_or(&decoded_path);
     let full_path = config.path.join(relative_path);
-    
+
     if !full_path.exists() {
         return (StatusCode::NOT_FOUND, "File not found").into_response();
     }
-    
+
     if full_path.is_file() {
         // Serve file
         match fs::read(&full_path).await {
@@ -69,7 +122,7 @@ async fn file_and_directory_handler(
                 } else {
                     "application/octet-stream"
                 };
-                
+
                 let headers = [(axum::http::header::CONTENT_TYPE, content_type)];
                 (headers, contents).into_response()
             }
@@ -87,15 +140,20 @@ async fn file_and_directory_handler(
                 return (StatusCode::FORBIDDEN, "Archive creation is disabled.").into_response();
             }
 
-            log::info!("Creating {} archive for path: {:?}", archive_method, full_path);
+            log::info!(
+                "Creating {} archive for path: {:?}",
+                archive_method,
+                full_path
+            );
             log::info!("Full path exists: {}", full_path.exists());
             log::info!("Full path is_dir: {}", full_path.is_dir());
             log::info!("Full path file_name: {:?}", full_path.file_name());
             log::info!("Full path as string: {}", full_path.display());
-            
+
             let file_name = format!(
                 "{}.{}",
-                full_path.file_name()
+                full_path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("archive"),
                 archive_method.extension()
@@ -106,12 +164,13 @@ async fn file_and_directory_handler(
             match archive_method.create_archive(&full_path, config.no_symlinks, &mut buffer) {
                 Ok(()) => {
                     log::info!("Archive created successfully! Size: {} bytes", buffer.len());
-                    
+
                     let mut response = Response::new(Body::from(buffer));
                     response.headers_mut().insert(
                         "content-type",
-                        HeaderValue::from_str(&archive_method.content_type())
-                            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+                        HeaderValue::from_str(&archive_method.content_type()).unwrap_or_else(
+                            |_| HeaderValue::from_static("application/octet-stream"),
+                        ),
                     );
                     response.headers_mut().insert(
                         "content-transfer-encoding",
@@ -119,21 +178,30 @@ async fn file_and_directory_handler(
                     );
                     response.headers_mut().insert(
                         "content-disposition",
-                        HeaderValue::from_str(&format!("attachment; filename={:?}", file_name)).unwrap(),
+                        HeaderValue::from_str(&format!("attachment; filename={:?}", file_name))
+                            .unwrap(),
                     );
-                    
+
                     return response;
                 }
                 Err(err) => {
                     log::error!("Archive creation failed: {:?}", err);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Archive creation failed: {}", err)).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Archive creation failed: {}", err),
+                    )
+                        .into_response();
                 }
             }
         } else {
             // Generate directory listing
             match generate_directory_listing(&full_path, &uri, &config).await {
                 Ok(html) => Html(html.into_string()).into_response(),
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read directory").into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not read directory",
+                )
+                    .into_response(),
             }
         }
     } else {
@@ -144,36 +212,39 @@ async fn file_and_directory_handler(
 async fn generate_directory_listing(
     dir_path: &Path,
     uri: &Uri,
-    config: &MiniserveConfig,
+    config: &Arc<MiniserveConfig>,
 ) -> Result<maud::Markup, std::io::Error> {
     let mut entries = Vec::new();
     let mut dir_entries = fs::read_dir(dir_path).await?;
-    
+
     while let Some(entry) = dir_entries.next_entry().await? {
         let file_name = entry.file_name().to_string_lossy().to_string();
         let metadata = entry.metadata().await.ok();
-        
-        let entry_type = if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+
+        let entry_type = if entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
             EntryType::Directory
         } else {
             EntryType::File
         };
-        
+
         let size = metadata
             .as_ref()
             .filter(|m| m.is_file())
             .map(|m| ByteSize::b(m.len()));
-        
-        let last_modification_date = metadata
-            .as_ref()
-            .and_then(|m| m.modified().ok());
-        
+
+        let last_modification_date = metadata.as_ref().and_then(|m| m.modified().ok());
+
         let link = if uri.path().ends_with('/') {
             format!("{}{}", uri.path(), file_name)
         } else {
             format!("{}/{}", uri.path(), file_name)
         };
-        
+
         entries.push(Entry {
             name: file_name,
             entry_type,
@@ -183,14 +254,19 @@ async fn generate_directory_listing(
             symlink_info: None,
         });
     }
-    
+
     // Create breadcrumbs
-    let path_components: Vec<&str> = uri.path().trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let path_components: Vec<&str> = uri
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut breadcrumbs = vec![Breadcrumb {
         name: "Home".to_string(),
         link: "/".to_string(),
     }];
-    
+
     let mut current_path = String::new();
     for component in path_components {
         current_path.push('/');
@@ -200,16 +276,16 @@ async fn generate_directory_listing(
             link: current_path.clone(),
         });
     }
-    
+
     // Mark the last breadcrumb as current (don't make it a link)
     if let Some(last) = breadcrumbs.last_mut() {
         last.link = ".".to_string();
     }
-    
+
     let is_root = uri.path() == "/" || uri.path().is_empty();
     let encoded_dir = uri.path().to_string();
     let query_params = ListingQueryParameters::default();
-    
+
     // Use the proper miniserve page render function
     Ok(page(
         entries,
@@ -285,7 +361,7 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         ));
     }
 
-    let inside_config = miniserve_config.clone();
+    let inside_config = Arc::new(miniserve_config.clone());
 
     let canon_path = miniserve_config
         .path
@@ -385,13 +461,16 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .map(|sock| sock.to_string().green().bold().to_string())
         .collect::<Vec<_>>();
 
-    let app = Router::new()
+    let upload_route = format!("{}/upload", &inside_config.route_prefix);
+
+    let app = Router::<Arc<MiniserveConfig>>::new()
         .layer(TraceLayer::new_for_http())
         .layer(tower::ServiceBuilder::new().layer(CompressionLayer::new()))
         .layer(from_fn_with_state(inside_config.clone(), configure_header))
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
+        .route(&upload_route, post(upload_file_handler))
         .fallback(file_and_directory_handler)
         .with_state(inside_config);
 
