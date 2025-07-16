@@ -111,7 +111,8 @@ pub fn compare_password(basic_auth_pwd: &str, required_auth_pwd: &RequiredPasswo
     }
 }
 
-fn match_auth(basic_auth: &BasicAuthParams, required_auth: &[RequiredAuth]) -> bool {
+/// Return `true` if `basic_auth` is matches any of `required_auth`
+pub fn match_auth(basic_auth: &BasicAuthParams, required_auth: &[RequiredAuth]) -> bool {
     required_auth
         .iter()
         .any(|RequiredAuth { username, password }| {

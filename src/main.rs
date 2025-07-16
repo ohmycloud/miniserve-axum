@@ -11,9 +11,8 @@ use colored::*;
 use fast_qr::QRBuilder;
 use log::{error, warn};
 use miniserve_axum::{
-    ArchiveMethod, Breadcrumb, CliArgs, Entry, EntryType,
-    ListingQueryParameters, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css,
-    favicon, healthcheck, log_error_chain, page,
+    ArchiveMethod, Breadcrumb, CliArgs, Entry, EntryType, ListingQueryParameters, MiniserveConfig,
+    QR_EC_LEVEL, StartupError, configure_header, css, favicon, healthcheck, log_error_chain, page,
 };
 use std::sync::Arc;
 use std::thread;
@@ -40,23 +39,23 @@ async fn upload_file_handler(
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     log::info!("Upload request received!");
-    
+
     // For now, upload to the root directory being served
     let target_dir = &config.path;
-    
+
     if !target_dir.exists() || !target_dir.is_dir() {
         log::error!("Target directory does not exist: {:?}", target_dir);
         return (StatusCode::BAD_REQUEST, "Target directory not found").into_response();
     }
-    
+
     // Process multipart fields
     while let Some(field) = multipart.next_field().await.unwrap_or(None) {
         if let Some(filename) = field.file_name() {
             let filename = filename.to_string();
             let file_path = target_dir.join(&filename);
-            
+
             log::info!("Uploading file: {:?} to {:?}", filename, file_path);
-            
+
             // Read the field data
             let data = match field.bytes().await {
                 Ok(data) => data,
@@ -65,23 +64,23 @@ async fn upload_file_handler(
                     return (StatusCode::BAD_REQUEST, "Failed to read upload data").into_response();
                 }
             };
-            
+
             // Write the file
             if let Err(e) = tokio::fs::write(&file_path, data).await {
                 log::error!("Failed to write file {:?}: {:?}", file_path, e);
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save file").into_response();
             }
-            
+
             log::info!("Successfully uploaded: {:?}", filename);
         }
     }
-    
+
     // Get the referer for redirect
     let return_path = headers
         .get(axum::http::header::REFERER)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("/");
-    
+
     log::info!("Upload completed, redirecting to: {}", return_path);
     axum::response::Redirect::to(return_path).into_response()
 }
@@ -518,27 +517,4 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .map_err(|e| StartupError::NetworkError(e.to_string()))?;
 
     Ok(())
-}
-
-/// Allows us to set low-level socket options
-///
-/// This mainly used to set `set_only_v6` socket option
-/// to get a consistent behavior across platforms.
-/// see: https://github.com/svenstaro/miniserve/pull/500
-fn create_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-    if addr.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
-    socket.set_reuse_address(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024 /* Default backlog */)?;
-    Ok(std::net::TcpListener::from(socket))
-}
-
-#[derive(serde::Deserialize, Debug)]
-enum ApiCommand {
-    /// Request the size of a particular directory
-    DirSize(String),
 }
