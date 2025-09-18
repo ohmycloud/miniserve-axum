@@ -7,7 +7,7 @@ use colored::*;
 use fast_qr::QRBuilder;
 use log::{error, warn};
 use miniserve_axum::{
-    CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, configure_header, css, favicon,
+    CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, api, configure_header, css, favicon,
     file_and_directory_handler, healthcheck, log_error_chain, upload_file_handler,
 };
 use std::sync::Arc;
@@ -190,6 +190,7 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
+        .route(&inside_config.api_route, post(api))
         .route(&upload_route, post(upload_file_handler))
         .fallback(file_and_directory_handler)
         .with_state(inside_config);
