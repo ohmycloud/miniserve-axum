@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Query, State};
-use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::extract::{Multipart, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -35,8 +35,8 @@ struct DownloadQuery {
 
 async fn upload_file_handler(
     State(config): State<Arc<MiniserveConfig>>,
-    headers: axum::http::HeaderMap,
-    mut multipart: axum::extract::Multipart,
+    headers: HeaderMap,
+    mut multipart: Multipart,
 ) -> impl IntoResponse {
     log::info!("Upload request received!");
 
