@@ -1,11 +1,12 @@
 use anyhow::Result;
 use axum::Router;
-use axum::middleware::from_fn_with_state;
+use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post};
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
 use log::{error, warn};
+use miniserve_axum::error_page::error_page_middleware;
 use miniserve_axum::{
     CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, api, configure_header, css, favicon,
     file_and_directory_handler, healthcheck, log_error_chain, upload_file_handler,
@@ -187,6 +188,7 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .layer(TraceLayer::new_for_http())
         .layer(tower::ServiceBuilder::new().layer(CompressionLayer::new()))
         .layer(from_fn_with_state(inside_config.clone(), configure_header))
+        .layer(from_fn(error_page_middleware))
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))

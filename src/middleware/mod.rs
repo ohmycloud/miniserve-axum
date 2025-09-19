@@ -1,11 +1,13 @@
 use crate::MiniserveConfig;
-use std::sync::Arc;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue},
     middleware::Next,
     response::Response,
 };
+use std::sync::Arc;
+
+pub mod error_page;
 
 pub async fn configure_header(
     State(state): State<Arc<MiniserveConfig>>,
