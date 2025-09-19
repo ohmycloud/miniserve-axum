@@ -1,3 +1,4 @@
+use crate::{ArchiveMethod, CurrentUser, MiniserveConfig, render};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -18,8 +19,6 @@ use std::{
 use strum::{Display, EnumString};
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
-
-use crate::{ArchiveMethod, CurrentUser, MiniserveConfig};
 
 /// "percent-encode sets" as defined by WHATWG specs:
 /// https://url.spec.whatwg.org/#percent-encoded-bytes
@@ -198,17 +197,10 @@ impl Directory {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct QueryParams {
-    pub sort: Option<SortingMethod>,
-    pub order: Option<SortingOrder>,
-    pub download: Option<ArchiveMethod>,
-}
-
 pub async fn directory_listing(
     uri: Uri,
     headers: HeaderMap,
-    Query(query_params): Query<QueryParams>,
+    Query(query_params): Query<ListingQueryParameters>,
     State(config): State<Arc<MiniserveConfig>>,
 ) -> Response {
     let current_user: Option<CurrentUser> = None; // 从请求中提取用户信息
@@ -463,10 +455,10 @@ pub async fn directory_listing(
         return response;
     } else {
         // 渲染 HTML 页面
-        let html_content = renderer::page(
+        let html_content = render::page(
             entries,
             readme,
-            &abs_uri,
+            &uri,
             is_root,
             query_params,
             &breadcrumbs,
@@ -474,7 +466,7 @@ pub async fn directory_listing(
             &config,
             current_user.as_ref(),
         )
-        .to_string();
+        .into_string();
 
         let mut response = Response::new(Body::from(html_content));
         response.headers_mut().insert(
@@ -488,25 +480,4 @@ pub async fn directory_listing(
 
 fn markdown_to_html(content: &str, options: &comrak::ComrakOptions) -> String {
     comrak::markdown_to_html(content, options)
-}
-
-// 假设的渲染器模块
-mod renderer {
-    use super::*;
-
-    pub fn page(
-        _entries: Vec<Entry>,
-        _readme: Option<(String, String)>,
-        abs_uri: &str,
-        is_root: bool,
-        query_params: QueryParams,
-        breadcrumbs: &[Breadcrumb],
-        encoded_dir: &str,
-        config: &MiniserveConfig,
-        current_user: Option<&CurrentUser>,
-    ) -> String {
-        // 实现页面渲染逻辑
-        // 这里应该返回 HTML 字符串
-        format!("<!DOCTYPE html><html><body><h1>Directory Listing</h1></body></html>")
-    }
 }
