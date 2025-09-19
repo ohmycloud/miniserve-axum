@@ -217,19 +217,7 @@ pub async fn directory_listing(
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost");
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("http");
 
-    let abs_uri = format!(
-        "{}://{}{}",
-        scheme,
-        host,
-        uri.path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or(serve_path)
-    );
     let is_root = base.parent().is_none() || Path::new(&serve_path) == Path::new(&random_route_abs);
 
     let encoded_dir = match base.strip_prefix(&random_route_abs) {

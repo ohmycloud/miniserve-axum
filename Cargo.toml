@@ -64,6 +64,7 @@ nanoid = "0.4.0"
 percent-encoding = "2.3.1"
 port_check = "0.2.1"
 regex = "1.11.1"
+reqwest = { version = "0.12.23", features = ["blocking", "multipart", "json", "rustls-tls"], default-features = false }
 rustls = { version = "0.23.27", features = [
     "ring",
     "std",
@@ -94,5 +95,7 @@ default = ["tls"]
 tls = ["rustls", "rustls-pemfile", "axum-server/tls-rustls"]
 
 [dev-dependencies]
+assert_cmd = "2.0.17"
+assert_fs = "1.1.3"
 pretty_assertions = "1.4.1"
 rstest = "0.25.0"
