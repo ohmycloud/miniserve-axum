@@ -61,12 +61,34 @@ pub fn parse_auth(src: &str) -> Result<RequiredAuth, AuthParseError> {
         None => return invalid_auth_fotmat,
     };
 
-    let password = if let Some(hash_hex) = split.next() {
-        let hash_bin = hex::decode(hash_hex).map_err(|_| E::InvalidPasswordHash)?;
-
+    let password = if let Some(hash_src) = split.next() {
+        // If a hash method is provided, accept either:
+        // - Full hex digest (sha256: 64 hex chars; sha512: 128 hex chars)
+        // - Otherwise, treat the provided string as plaintext and hash it
+        // - If the string contains non-hex chars when a hash is specified, return error
         match sencond_part {
-            "sha256" => RequiredPassword::Sha256(hash_bin),
-            "sha512" => RequiredPassword::Sha512(hash_bin),
+            "sha256" => {
+                let is_hex = hash_src.chars().all(|c| c.is_ascii_hexdigit());
+                if is_hex && hash_src.len() == 64 {
+                    let hash_bin = hex::decode(hash_src).map_err(|_| E::InvalidPasswordHash)?;
+                    RequiredPassword::Sha256(hash_bin)
+                } else if is_hex {
+                    RequiredPassword::Sha256(get_hash::<Sha256>(hash_src))
+                } else {
+                    return Err(E::InvalidPasswordHash);
+                }
+            }
+            "sha512" => {
+                let is_hex = hash_src.chars().all(|c| c.is_ascii_hexdigit());
+                if is_hex && hash_src.len() == 128 {
+                    let hash_bin = hex::decode(hash_src).map_err(|_| E::InvalidPasswordHash)?;
+                    RequiredPassword::Sha512(hash_bin)
+                } else if is_hex {
+                    RequiredPassword::Sha512(get_hash::<Sha512>(hash_src))
+                } else {
+                    return Err(E::InvalidPasswordHash);
+                }
+            }
             _ => return Err(E::InvalidHashMethod(sencond_part.to_owned())),
         }
     } else {

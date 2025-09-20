@@ -43,7 +43,7 @@ enum FileHash {
 }
 
 impl FileHash {
-    pub fn get_hasher(&self) -> Box<dyn DynDigest> {
+    pub fn get_hasher(&self) -> Box<dyn DynDigest + Send> {
         match self {
             Self::SHA256(_) => Box::new(Sha256::new()),
             Self::SHA512(_) => Box::new(Sha512::new()),
@@ -418,7 +418,7 @@ pub async fn upload_file(
     Query(query): Query<FileOpQueryParameters>,
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
-) -> Result<impl IntoResponse, RuntimeError> {
+) -> Result<axum::response::Response, RuntimeError> {
     let upload_path = sanitize_path(&query.path, conf.show_hidden).ok_or_else(|| {
         RuntimeError::InvalidPathError("Invalid value for 'path' parameter".to_string())
     })?;
@@ -503,57 +503,94 @@ pub async fn upload_file(
         .unwrap_or("/");
 
     // Redirect to the referring page
-    Ok(Redirect::to(return_path))
+    Ok(Redirect::to(return_path).into_response())
 }
 
 pub async fn upload_file_handler(
-    State(config): State<Arc<MiniserveConfig>>,
+    State(conf): State<Arc<MiniserveConfig>>,
+    Query(query): Query<FileOpQueryParameters>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     log::info!("Upload request received!");
 
-    // For now, upload to the root directory being served
-    let target_dir = &config.path;
+    // Sanitize and validate target path
+    let upload_path = match sanitize_path(&query.path, conf.show_hidden) {
+        Some(p) => p,
+        None => return RuntimeError::InvalidPathError("Invalid value for 'path' parameter".to_string()).into_response(),
+    };
 
-    if !target_dir.exists() || !target_dir.is_dir() {
-        log::error!("Target directory does not exist: {:?}", target_dir);
-        return (StatusCode::BAD_REQUEST, "Target directory not found").into_response();
+    let app_root_dir = match conf.path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return RuntimeError::IoError("Failed to resolve path served by miniserve".to_string(), e).into_response(),
+    };
+
+    // Allow only configured upload directories
+    let upload_allowed = conf.allowed_upload_dir.is_empty()
+        || conf
+            .allowed_upload_dir
+            .iter()
+            .any(|s| upload_path.starts_with(s));
+    if !upload_allowed {
+        return RuntimeError::UploadForbiddenError.into_response();
     }
 
-    // Process multipart fields
-    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
-        if let Some(filename) = field.file_name() {
-            let filename = filename.to_string();
-            let file_path = target_dir.join(&filename);
+    // Disallow the target path to go outside of the served directory
+    let non_canonicalized_target_dir = app_root_dir.join(&upload_path);
+    let within_root = match non_canonicalized_target_dir.canonicalize() {
+        Ok(path) if !conf.no_symlinks => path,
+        Ok(path) if path.starts_with(&app_root_dir) => path,
+        _ => return RuntimeError::InvalidHttpRequestError("Invalid value for 'path' parameter".to_string()).into_response(),
+    };
+    let _ = within_root; // only used for validation above
 
-            log::info!("Uploading file: {:?} to {:?}", filename, file_path);
-
-            // Read the field data
-            let data = match field.bytes().await {
-                Ok(data) => data,
-                Err(e) => {
-                    log::error!("Failed to read upload data: {:?}", e);
-                    return (StatusCode::BAD_REQUEST, "Failed to read upload data").into_response();
-                }
-            };
-
-            // Write the file
-            if let Err(e) = tokio::fs::write(&file_path, data).await {
-                log::error!("Failed to write file {:?}: {:?}", file_path, e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save file").into_response();
+    // Optional file hash headers
+    let file_hash = if let (Some(hash), Some(hash_function)) = (
+        headers.get("X-File-Hash").and_then(|h| h.to_str().ok()),
+        headers.get("X-File-Hash-Function").and_then(|h| h.to_str().ok()),
+    ) {
+        match hash_function.to_ascii_uppercase().as_str() {
+            "SHA256" => Some(FileHash::SHA256(hash.to_string())),
+            "SHA512" => Some(FileHash::SHA512(hash.to_string())),
+            sha => {
+                return RuntimeError::InvalidHttpRequestError(format!(
+                    "Invalid header value found for 'X-File-Hash-Function'. Supported values are SHA256 or SHA512. Found {sha}.",
+                ))
+                .into_response();
             }
+        }
+    } else {
+        None
+    };
+    let hash_ref = file_hash.as_ref();
 
-            log::info!("Successfully uploaded: {:?}", filename);
+    let upload_directory = conf.temp_upload_directory.as_ref();
+
+    // Process multipart fields (mkdir or file uploads)
+    while let Some(field) = match multipart.next_field().await { Ok(f) => f, Err(e) => return RuntimeError::MultipartError(e.to_string()).into_response() } {
+        if let Err(e) = handle_multipart(
+            field,
+            non_canonicalized_target_dir.clone(),
+            HandleMultipartOpts {
+                overwrite_files: conf.overwrite_files,
+                allow_mkdir: conf.mkdir_enabled,
+                allow_hidden_paths: conf.show_hidden,
+                allow_symlinks: !conf.no_symlinks,
+                file_hash: hash_ref,
+                upload_directory,
+            },
+        )
+        .await
+        {
+            return e.into_response();
         }
     }
 
-    // Get the referer for redirect
+    // Redirect back to referer
     let return_path = headers
         .get(axum::http::header::REFERER)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("/");
-
     log::info!("Upload completed, redirecting to: {}", return_path);
     axum::response::Redirect::to(return_path).into_response()
 }

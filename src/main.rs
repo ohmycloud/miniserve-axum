@@ -2,6 +2,9 @@ use anyhow::Result;
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post};
+use axum::extract::{State, Multipart, Query};
+use axum::http::HeaderMap;
+use axum::response::Response;
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
@@ -9,7 +12,7 @@ use log::{error, warn};
 use miniserve_axum::error_page::error_page_middleware;
 use miniserve_axum::{
     CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, api, configure_header, css, favicon,
-    file_and_directory_handler, healthcheck, log_error_chain, upload_file_handler,
+    file_and_directory_handler, healthcheck, log_error_chain, upload_file_handler, FileOpQueryParameters,
 };
 use std::sync::Arc;
 use std::thread;
@@ -193,7 +196,9 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
         .route(&inside_config.api_route, post(api))
-        .route(&upload_route, post(upload_file_handler))
+        .route(&upload_route, post(|state, query, headers, multipart| async move {
+            upload_route_handler(state, query, headers, multipart).await
+        }))
         .fallback(file_and_directory_handler)
         .with_state(inside_config);
 
@@ -241,4 +246,13 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .map_err(|e| StartupError::NetworkError(e.to_string()))?;
 
     Ok(())
+}
+
+async fn upload_route_handler(
+    state: State<Arc<MiniserveConfig>>,
+    query: Query<FileOpQueryParameters>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    upload_file_handler(state, query, headers, multipart).await
 }
