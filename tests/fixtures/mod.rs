@@ -175,14 +175,15 @@ pub fn port() -> u16 {
 
 /// Run miniserve as a server; Start with a temporary directory, a free port and some
 /// optional arguments then wait for a while for the server setup to complete.
-pub fn server<I>(args: I) -> TestServer
+#[fixture]
+pub fn server<I>(#[default(&[] as &[&str])] args: I) -> TestServer
 where
     I: IntoIterator + Clone,
     I::Item: AsRef<std::ffi::OsStr>,
 {
     let port = port();
     let tmpdir = tmpdir();
-    let mut child = Command::cargo_bin("miniserve")
+    let mut child = Command::cargo_bin("miniserve-axum")
         .expect("Couldn't find test binary")
         .arg(tmpdir.path())
         .arg("-v")
