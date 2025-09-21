@@ -124,6 +124,7 @@ async fn save_file(
     overwrite_files: bool,
     file_checksum: Option<&FileHash>,
     temporary_upload_directory: Option<&PathBuf>,
+    expected_size: Option<u64>,
 ) -> Result<u64, RuntimeError> {
     if !overwrite_files && file_path.exists() {
         return Err(RuntimeError::DuplicateFileError);
@@ -170,7 +171,8 @@ async fn save_file(
     let mut temp_file = tokio::fs::File::from_std(file);
 
     let mut written_len = 0;
-    let mut hasher = file_checksum.as_ref().map(|h| h.get_hasher());
+    // If the client provided a checksum header, prepare a hasher and update it as we stream bytes.
+    let mut stream_hasher = file_checksum.as_ref().map(|h| h.get_hasher());
     let mut save_upload_file_error: Option<RuntimeError> = None;
 
     // This while loop take a stream (in this case `field`) and awaits
@@ -178,10 +180,9 @@ async fn save_file(
     // the file from the HTTP connection and writes it to disk or until
     // the stream from the multipart request is aborted.
     while let Some(Ok(bytes)) = field.next().await {
-        // If the hasher exists (if the user has also sent a chunksum with the request)
-        // then we want to update the hasher with the new bytes uploaded.
-        if let Some(hasher) = hasher.as_mut() {
-            hasher.update(&bytes)
+        // Update hash with the streamed bytes, if requested
+        if let Some(hasher) = stream_hasher.as_mut() {
+            hasher.update(&bytes);
         }
         // Write the bytes from the stream into our temporary file.
         if let Err(e) = temp_file.write_all(&bytes).await {
@@ -218,20 +219,29 @@ async fn save_file(
         return Err(e);
     }
 
-    // There isn't a way to get notified when a request is cancelled
-    // by the user in Axum it seems.
-    // Therefore, we are relying on the fact that the web UI uploads a
-    // hash of the file to determine if it was completed uploaded or not.
-    if let Some(hasher) = hasher {
-        if let Some(expected_hash) = file_checksum.as_ref().map(|f| f.get_hash()) {
-            let actual_hash = hex::encode(hasher.finalize());
-            if actual_hash != expected_hash {
-                warn!(
-                    "The expected file hash {expected_hash} did not match the calculated hash of {actual_hash}. This can be caused if a file upload was aborted."
-                );
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(RuntimeError::UploadHashMismatchError);
-            }
+    // Validate size if the client sent X-File-Size
+    if let Some(expected) = expected_size {
+        if written_len != expected {
+            warn!(
+                "Expected file size {} did not match received size {}. Treating as aborted upload.",
+                expected,
+                written_len
+            );
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(RuntimeError::UploadHashMismatchError);
+        }
+    }
+
+    // After fully writing, if a checksum was provided by client, compare against streamed hash.
+    if let (Some(hasher), Some(expected_hash)) = (stream_hasher, file_checksum.as_ref().map(|f| f.get_hash())) {
+        let expected_hash = expected_hash.to_ascii_lowercase();
+        let actual_hash = hex::encode(hasher.finalize());
+        if actual_hash != expected_hash {
+            warn!(
+                "The expected file hash {expected_hash} did not match the calculated hash of {actual_hash}. This can be caused if a file upload was aborted."
+            );
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(RuntimeError::UploadHashMismatchError);
         }
     }
 
@@ -273,6 +283,7 @@ struct HandleMultipartOpts<'a> {
     allow_symlinks: bool,
     file_hash: Option<&'a FileHash>,
     upload_directory: Option<&'a PathBuf>,
+    expected_size: Option<u64>,
 }
 
 /// Handles a single field in a multipart form
@@ -288,6 +299,7 @@ async fn handle_multipart(
         allow_symlinks,
         file_hash,
         upload_directory,
+        expected_size,
     } = opts;
     let field_name = field.name().expect("No name field found").to_string();
 
@@ -398,6 +410,7 @@ async fn handle_multipart(
         overwrite_files,
         file_hash,
         upload_directory,
+        expected_size,
     )
     .await
 }
@@ -450,6 +463,16 @@ pub async fn upload_file(
     }?;
 
     let upload_directory = conf.temp_upload_directory.as_ref();
+    // Optional expected size header (provided by client)
+    let expected_size = headers
+        .get("X-File-Size")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    // Optional expected size header (provided by client)
+    let expected_size = headers
+        .get("X-File-Size")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
     let file_hash = if let (Some(hash), Some(hash_function)) = (
         headers.get("X-File-Hash").and_then(|h| h.to_str().ok()),
@@ -489,6 +512,7 @@ pub async fn upload_file(
                 allow_symlinks: !conf.no_symlinks,
                 file_hash: hash_ref,
                 upload_directory,
+                expected_size,
             },
         )
         .await?;
@@ -517,12 +541,23 @@ pub async fn upload_file_handler(
     // Sanitize and validate target path
     let upload_path = match sanitize_path(&query.path, conf.show_hidden) {
         Some(p) => p,
-        None => return RuntimeError::InvalidPathError("Invalid value for 'path' parameter".to_string()).into_response(),
+        None => {
+            return RuntimeError::InvalidPathError(
+                "Invalid value for 'path' parameter".to_string(),
+            )
+            .into_response();
+        }
     };
 
     let app_root_dir = match conf.path.canonicalize() {
         Ok(p) => p,
-        Err(e) => return RuntimeError::IoError("Failed to resolve path served by miniserve".to_string(), e).into_response(),
+        Err(e) => {
+            return RuntimeError::IoError(
+                "Failed to resolve path served by miniserve".to_string(),
+                e,
+            )
+            .into_response();
+        }
     };
 
     // Allow only configured upload directories
@@ -540,14 +575,21 @@ pub async fn upload_file_handler(
     let within_root = match non_canonicalized_target_dir.canonicalize() {
         Ok(path) if !conf.no_symlinks => path,
         Ok(path) if path.starts_with(&app_root_dir) => path,
-        _ => return RuntimeError::InvalidHttpRequestError("Invalid value for 'path' parameter".to_string()).into_response(),
+        _ => {
+            return RuntimeError::InvalidHttpRequestError(
+                "Invalid value for 'path' parameter".to_string(),
+            )
+            .into_response();
+        }
     };
     let _ = within_root; // only used for validation above
 
     // Optional file hash headers
     let file_hash = if let (Some(hash), Some(hash_function)) = (
         headers.get("X-File-Hash").and_then(|h| h.to_str().ok()),
-        headers.get("X-File-Hash-Function").and_then(|h| h.to_str().ok()),
+        headers
+            .get("X-File-Hash-Function")
+            .and_then(|h| h.to_str().ok()),
     ) {
         match hash_function.to_ascii_uppercase().as_str() {
             "SHA256" => Some(FileHash::SHA256(hash.to_string())),
@@ -565,9 +607,17 @@ pub async fn upload_file_handler(
     let hash_ref = file_hash.as_ref();
 
     let upload_directory = conf.temp_upload_directory.as_ref();
+    // Optional expected size header (provided by client)
+    let expected_size = headers
+        .get("X-File-Size")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
     // Process multipart fields (mkdir or file uploads)
-    while let Some(field) = match multipart.next_field().await { Ok(f) => f, Err(e) => return RuntimeError::MultipartError(e.to_string()).into_response() } {
+    while let Some(field) = match multipart.next_field().await {
+        Ok(f) => f,
+        Err(e) => return RuntimeError::MultipartError(e.to_string()).into_response(),
+    } {
         if let Err(e) = handle_multipart(
             field,
             non_canonicalized_target_dir.clone(),
@@ -578,6 +628,7 @@ pub async fn upload_file_handler(
                 allow_symlinks: !conf.no_symlinks,
                 file_hash: hash_ref,
                 upload_directory,
+                expected_size,
             },
         )
         .await

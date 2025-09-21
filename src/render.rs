@@ -1014,6 +1014,7 @@ fn page_header(
                                         xhr.open('post', form.getAttribute("action"), true);
                                         xhr.setRequestHeader('X-File-Hash', fileHash);
                                         xhr.setRequestHeader('X-File-Hash-Function', 'SHA256');
+                                        xhr.setRequestHeader('X-File-Size', String(file.size));
                                         xhr.send(formData);
                                     }
                                 })

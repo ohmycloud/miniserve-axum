@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post};
-use axum::extract::{State, Multipart, Query};
+use axum::extract::{State, Multipart, Query, DefaultBodyLimit};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use clap::{CommandFactory, Parser, crate_version};
@@ -200,7 +200,9 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
             upload_route_handler(state, query, headers, multipart).await
         }))
         .fallback(file_and_directory_handler)
-        .with_state(inside_config);
+        .with_state(inside_config)
+        // Allow large file uploads by disabling Axum's default 2MB body limit
+        .layer(DefaultBodyLimit::disable());
 
     println!("Bound to {}", display_sockets.join(", "));
 
