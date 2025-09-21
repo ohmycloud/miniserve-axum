@@ -1,18 +1,20 @@
 use anyhow::Result;
 use axum::Router;
-use axum::middleware::{from_fn, from_fn_with_state};
-use axum::routing::{get, post};
-use axum::extract::{State, Multipart, Query, DefaultBodyLimit};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::HeaderMap;
+use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::Response;
+use axum::routing::{get, post};
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
 use log::{error, warn};
+use miniserve_axum::basic_auth_guard;
 use miniserve_axum::error_page::error_page_middleware;
 use miniserve_axum::{
-    CliArgs, MiniserveConfig, QR_EC_LEVEL, StartupError, api, configure_header, css, favicon,
-    file_and_directory_handler, healthcheck, log_error_chain, upload_file_handler, FileOpQueryParameters,
+    CliArgs, FileOpQueryParameters, MiniserveConfig, QR_EC_LEVEL, StartupError, api,
+    configure_header, css, favicon, file_and_directory_handler, healthcheck, log_error_chain,
+    upload_file_handler,
 };
 use std::sync::Arc;
 use std::thread;
@@ -185,9 +187,8 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .map(|sock| sock.to_string().green().bold().to_string())
         .collect::<Vec<_>>();
 
-    let upload_route = format!("{}/upload", &inside_config.route_prefix);
-
-    let app = Router::<Arc<MiniserveConfig>>::new()
+    // Public routes
+    let base_app = Router::<Arc<MiniserveConfig>>::new()
         .layer(TraceLayer::new_for_http())
         .layer(tower::ServiceBuilder::new().layer(CompressionLayer::new()))
         .layer(from_fn_with_state(inside_config.clone(), configure_header))
@@ -195,14 +196,28 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
-        .route(&inside_config.api_route, post(api))
-        .route(&upload_route, post(|state, query, headers, multipart| async move {
-            upload_route_handler(state, query, headers, multipart).await
-        }))
+        .route(&inside_config.api_route, post(api));
+
+    // Protected content
+    let protected = Router::<Arc<MiniserveConfig>>::new()
+        .route(
+            "/upload",
+            post(|state, query, headers, multipart| async move {
+                upload_route_handler(state, query, headers, multipart).await
+            }),
+        )
         .fallback(file_and_directory_handler)
-        .with_state(inside_config)
-        // Allow large file uploads by disabling Axum's default 2MB body limit
-        .layer(DefaultBodyLimit::disable());
+        .layer(from_fn_with_state(inside_config.clone(), basic_auth_guard));
+
+    // Use merge for empty prefix, nest otherwise
+    let app = if inside_config.route_prefix.is_empty() {
+        base_app.merge(protected)
+    } else {
+        base_app.nest(&inside_config.route_prefix, protected)
+    }
+    .with_state(inside_config)
+    // Allow large file uploads by disabling Axum's default 2MB body limit
+    .layer(DefaultBodyLimit::disable());
 
     println!("Bound to {}", display_sockets.join(", "));
 

@@ -2074,6 +2074,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "axum-server",
+ "base64 0.22.1",
  "bytes",
  "bytesize",
  "chrono",

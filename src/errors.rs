@@ -88,21 +88,35 @@ impl IntoResponse for RuntimeError {
         use RuntimeError as E;
         use StatusCode as S;
 
-        let res = match self {
-            E::IoError(_, _) => S::INTERNAL_SERVER_ERROR,
-            E::MultipartError(_) => S::BAD_REQUEST,
-            E::DuplicateFileError => S::CONFLICT,
-            E::UploadHashMismatchError => S::BAD_REQUEST,
-            E::UploadForbiddenError => S::FORBIDDEN,
-            E::InvalidPathError(_) => S::BAD_REQUEST,
-            E::InsufficientPermissionsError(_) => S::FORBIDDEN,
-            E::ParseError(_, _) => S::BAD_REQUEST,
-            E::ArchiveCreationError(_, _) => S::INTERNAL_SERVER_ERROR,
-            E::ArchiveCreationDetailError(_) => S::INTERNAL_SERVER_ERROR,
-            E::InvalidHttpCredentials => S::UNAUTHORIZED,
-            E::InvalidHttpRequestError(_) => S::BAD_REQUEST,
-            E::RouteNotFoundError(_) => S::NOT_FOUND,
-        };
-        res.into_response()
+        match self {
+            E::InvalidHttpCredentials => {
+                let mut res = S::UNAUTHORIZED.into_response();
+                let headers = res.headers_mut();
+                headers.insert(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static("Basic realm=\"miniserve\""),
+                );
+                res
+            }
+            other => {
+                let res = match other {
+                    E::IoError(_, _) => S::INTERNAL_SERVER_ERROR,
+                    E::MultipartError(_) => S::BAD_REQUEST,
+                    E::DuplicateFileError => S::CONFLICT,
+                    E::UploadHashMismatchError => S::BAD_REQUEST,
+                    E::UploadForbiddenError => S::FORBIDDEN,
+                    E::InvalidPathError(_) => S::BAD_REQUEST,
+                    E::InsufficientPermissionsError(_) => S::FORBIDDEN,
+                    E::ParseError(_, _) => S::BAD_REQUEST,
+                    E::ArchiveCreationError(_, _) => S::INTERNAL_SERVER_ERROR,
+                    E::ArchiveCreationDetailError(_) => S::INTERNAL_SERVER_ERROR,
+                    E::InvalidHttpRequestError(_) => S::BAD_REQUEST,
+                    E::RouteNotFoundError(_) => S::NOT_FOUND,
+                    // already handled InvalidHttpCredentials above
+                    E::InvalidHttpCredentials => S::UNAUTHORIZED,
+                };
+                res.into_response()
+            }
+        }
     }
 }
