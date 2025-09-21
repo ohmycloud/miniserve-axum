@@ -224,8 +224,7 @@ async fn save_file(
         if written_len != expected {
             warn!(
                 "Expected file size {} did not match received size {}. Treating as aborted upload.",
-                expected,
-                written_len
+                expected, written_len
             );
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(RuntimeError::UploadHashMismatchError);
@@ -233,7 +232,9 @@ async fn save_file(
     }
 
     // After fully writing, if a checksum was provided by client, compare against streamed hash.
-    if let (Some(hasher), Some(expected_hash)) = (stream_hasher, file_checksum.as_ref().map(|f| f.get_hash())) {
+    if let (Some(hasher), Some(expected_hash)) =
+        (stream_hasher, file_checksum.as_ref().map(|f| f.get_hash()))
+    {
         let expected_hash = expected_hash.to_ascii_lowercase();
         let actual_hash = hex::encode(hasher.finalize());
         if actual_hash != expected_hash {
@@ -463,11 +464,6 @@ pub async fn upload_file(
     }?;
 
     let upload_directory = conf.temp_upload_directory.as_ref();
-    // Optional expected size header (provided by client)
-    let expected_size = headers
-        .get("X-File-Size")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
     // Optional expected size header (provided by client)
     let expected_size = headers
         .get("X-File-Size")
