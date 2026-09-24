@@ -1,9 +1,9 @@
-use crate::{MiniserveConfig, BasicAuthParams, CurrentUser, match_auth};
+use crate::{BasicAuthParams, CurrentUser, MiniserveConfig, match_auth};
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, header::AUTHORIZATION, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::AUTHORIZATION},
     middleware::Next,
-    response::{Response, IntoResponse},
+    response::{IntoResponse, Response},
 };
 use base64::Engine as _;
 use std::sync::Arc;
@@ -27,7 +27,10 @@ pub async fn configure_header(
     }
     let mut res = next.run(req).await;
     for (header_name, header_value) in headers {
-        res.headers_mut().insert(header_name.unwrap(), header_value);
+        let name = header_name.unwrap();
+        if !res.headers().contains_key(&name) {
+            res.headers_mut().insert(name, header_value);
+        }
     }
     res
 }
@@ -78,16 +81,21 @@ pub async fn basic_auth_guard(
         Err(_) => return unauthorized_response(),
     };
     let mut split = decoded_str.splitn(2, ':');
-    let username = match split.next() { Some(u) => u, None => "" };
-    let password = match split.next() { Some(p) => p, None => "" };
+    let username = split.next().unwrap_or_default();
+    let password = split.next().unwrap_or_default();
 
-    let creds = BasicAuthParams { username: username.to_string(), password: password.to_string() };
+    let creds = BasicAuthParams {
+        username: username.to_string(),
+        password: password.to_string(),
+    };
     if !match_auth(&creds, &state.auth) {
         return unauthorized_response();
     }
 
     // Attach current user to request extensions for downstream handlers (optional use)
-    req.extensions_mut().insert(CurrentUser { name: username.to_string() });
+    req.extensions_mut().insert(CurrentUser {
+        name: username.to_string(),
+    });
 
     next.run(req).await
 }

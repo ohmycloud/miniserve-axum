@@ -1,7 +1,7 @@
 use crate::{ArchiveMethod, CurrentUser, MiniserveConfig, render};
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
@@ -46,7 +46,8 @@ pub struct ListingQueryParameters {
     pub sort: Option<SortingMethod>,
     pub order: Option<SortingOrder>,
     pub raw: Option<bool>,
-    download: Option<ArchiveMethod>,
+    pub search: Option<String>,
+    pub download: Option<ArchiveMethod>,
 }
 
 #[derive(Debug, serde::Deserialize, Default, Clone, EnumString, Display, Copy, ValueEnum)]
@@ -183,14 +184,14 @@ impl Directory {
 
     /// Is this entry visible from this directory?
     pub async fn is_visible(&self, entry: &tokio::fs::DirEntry) -> bool {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with('.') {
-                return false;
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && name.starts_with('.')
+        {
+            return false;
         }
         if let Ok(ref md) = entry.metadata().await {
             let ft = md.file_type();
-            return ft.is_dir() || ft.is_file() || ft.is_symlink();
+            ft.is_dir() || ft.is_file() || ft.is_symlink()
         } else {
             false
         }
@@ -198,25 +199,40 @@ impl Directory {
 }
 
 pub async fn directory_listing(
+    dir_path: PathBuf,
     uri: Uri,
     headers: HeaderMap,
-    Query(query_params): Query<ListingQueryParameters>,
+    query_params: ListingQueryParameters,
     State(config): State<Arc<MiniserveConfig>>,
+    current_user: Option<CurrentUser>,
 ) -> Response {
-    let current_user: Option<CurrentUser> = None; // 从请求中提取用户信息
-
     if config.disable_indexing {
         return (StatusCode::NOT_FOUND, "File not found.").into_response();
     }
 
     let serve_path = uri.path();
     let base = Path::new(serve_path);
-    let random_route_abs = format!("/{}", config.route_prefix);
+    let random_route_abs = if config.route_prefix.is_empty() {
+        "/".to_owned()
+    } else {
+        config.route_prefix.clone()
+    };
 
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost");
+    let scheme = if config.tls_rustls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let abs_uri = Uri::builder()
+        .scheme(scheme)
+        .authority(host)
+        .path_and_query(uri.path())
+        .build()
+        .unwrap_or_else(|_| uri.clone());
 
     let is_root = base.parent().is_none() || Path::new(&serve_path) == Path::new(&random_route_abs);
 
@@ -234,7 +250,7 @@ pub async fn directory_listing(
         let decoded = percent_decode_str(&encoded_dir).decode_utf8_lossy();
 
         let mut res: Vec<Breadcrumb> = Vec::new();
-        let mut link_accumulator = format!("{}/", &config.route_prefix);
+        let mut link_accumulator = format!("{}/", config.route_prefix);
         let mut components = Path::new(&*decoded).components().peekable();
 
         while let Some(c) = components.next() {
@@ -266,13 +282,14 @@ pub async fn directory_listing(
 
     // 创建目录对象
     let dir = Directory {
-        base: PathBuf::from(serve_path),
-        path: PathBuf::from(serve_path),
+        base: config.path.clone(),
+        path: dir_path,
     };
 
     let mut entries: Vec<Entry> = Vec::new();
     let mut readme: Option<(String, String)> = None;
     let readme_rx: Regex = Regex::new("^readme([.](md|txt))?$").unwrap();
+    let search = query_params.search.as_ref().map(|s| s.to_lowercase());
 
     // 读取目录条目
     let read_dir_result = tokio::fs::read_dir(&dir.path).await;
@@ -293,15 +310,26 @@ pub async fn directory_listing(
             Err(_) => continue,
         };
 
-        if dir.is_visible(&entry).await || config.show_hidden {
+        if (dir.is_visible(&entry).await || config.show_hidden)
+            && search.as_ref().is_none_or(|s| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(s)
+            })
+        {
             // show file url as relative to static path
             let file_name = entry.file_name().to_string_lossy().to_string();
-            let (is_symlink, metadata) = match entry.metadata().await {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    // for symlinks, get the metadata of the original file
-                    (true, std::fs::metadata(entry.path()))
-                }
-                res => (false, res),
+            let is_symlink = entry
+                .file_type()
+                .await
+                .map(|t| t.is_symlink())
+                .unwrap_or(false);
+            let metadata = if is_symlink {
+                tokio::fs::metadata(entry.path()).await
+            } else {
+                entry.metadata().await
             };
             let symlink_dest = (is_symlink && config.show_symlink_info)
                 .then(|| entry.path())
@@ -329,10 +357,23 @@ pub async fn directory_listing(
                         symlink_dest,
                     ));
                 } else if metadata.is_file() {
+                    let file_link = match &config.file_external_url {
+                        Some(base) => format!(
+                            "{}/{}",
+                            base.trim_end_matches('/'),
+                            format!(
+                                "{}/{}",
+                                encoded_dir.trim_matches('/'),
+                                utf8_percent_encode(&file_name, COMPONENT)
+                            )
+                            .trim_start_matches('/')
+                        ),
+                        None => file_url,
+                    };
                     entries.push(Entry::new(
                         file_name.clone(),
                         EntryType::File,
-                        file_url,
+                        file_link,
                         Some(bytesize::ByteSize::b(metadata.len())),
                         last_modification_date,
                         symlink_dest,
@@ -346,7 +387,7 @@ pub async fn directory_listing(
                                     // 使用 comrak 或其他 markdown 处理器
                                     markdown_to_html(&content, &comrak::ComrakOptions::default())
                                 } else {
-                                    format!("<pre>{}</pre>", content)
+                                    format!("<pre>{}</pre>", maud::html! {(content)}.into_string())
                                 },
                             ));
                         }
@@ -401,7 +442,7 @@ pub async fn directory_listing(
         log::info!(
             "Creating an archive ({extension}) of {path}...",
             extension = archive_method.extension(),
-            path = &dir.path.display().to_string()
+            path = dir.path.display()
         );
 
         let file_name = format!(
@@ -417,7 +458,7 @@ pub async fn directory_listing(
         // 在后台线程中创建归档
         let dir_path = dir.path.clone();
         let skip_symlinks = config.no_symlinks;
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             if let Err(err) = archive_method.create_archive(dir_path, skip_symlinks, pipe) {
                 log::error!("Error during archive creation: {:?}", err);
             }
@@ -440,13 +481,13 @@ pub async fn directory_listing(
             HeaderValue::from_str(&format!("attachment; filename={:?}", file_name)).unwrap(),
         );
 
-        return response;
+        response
     } else {
         // 渲染 HTML 页面
         let html_content = render::page(
             entries,
             readme,
-            &uri,
+            &abs_uri,
             is_root,
             query_params,
             &breadcrumbs,

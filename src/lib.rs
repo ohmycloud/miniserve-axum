@@ -1,4 +1,3 @@
-mod app;
 mod archive;
 mod args;
 mod auth;
@@ -12,6 +11,7 @@ mod listing;
 mod middleware;
 mod pipe;
 mod render;
+mod serve;
 mod webdav_fs;
 
 pub use archive::*;
@@ -27,6 +27,7 @@ pub use listing::*;
 pub use middleware::*;
 pub use pipe::*;
 pub use render::*;
+pub use serve::*;
 pub use webdav_fs::*;
 
 static STYLESHEET: &str = grass::include!("data/style.scss");

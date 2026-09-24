@@ -1,44 +1,15 @@
-use assert_cmd::prelude::*;
-use assert_fs::fixture::TempDir;
-use assert_fs::prelude::{FileWriteStr, PathChild, SymlinkToDir, SymlinkToFile};
-use port_check::free_local_port;
-use reqwest::Url;
-use rstest::fixture;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::thread::{self, sleep};
+use std::thread;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-pub struct TestServer {
-    port: u16,
-    tmpdir: TempDir,
-    child: Child,
-    is_tls: bool,
-}
-
-impl TestServer {
-    pub fn new(port: u16, tmpdir: TempDir, child: Child, is_tls: bool) -> Self {
-        Self {
-            port,
-            tmpdir,
-            child,
-            is_tls,
-        }
-    }
-
-    pub fn url(&self) -> Url {
-        let protocol = if self.is_tls { "https" } else { "http" };
-        Url::parse(&format!("{}://localhost:{}", protocol, self.port)).unwrap()
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        self.tmpdir.path()
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-}
+use assert_cmd::cargo;
+use assert_fs::fixture::TempDir;
+use assert_fs::prelude::*;
+use reqwest::Url;
+use reqwest::blocking::{Client, ClientBuilder};
+use rstest::fixture;
 
 /// Error type used by tests
 pub type Error = Box<dyn std::error::Error>;
@@ -47,8 +18,8 @@ pub type Error = Box<dyn std::error::Error>;
 pub static FILES: &[&str] = &[
     "test.txt",
     "test.html",
+    "with space.txt",
     "test.mkv",
-    "test.pdf",
     #[cfg(not(windows))]
     "test \" \' & < >.csv",
     #[cfg(not(windows))]
@@ -74,7 +45,7 @@ pub static HIDDEN_DIRECTORIES: &[&str] = &[".hidden_dir1/", ".hidden space dir/"
 /// Name of a deeply nested file
 pub static DEEPLY_NESTED_FILE: &str = "very/deeply/nested/test.rs";
 
-/// Name of a directory inside a symlinked directory
+/// Name of a symlink pointing to a directory
 pub static DIRECTORY_SYMLINK: &str = "dir_symlink/";
 
 /// Name of a directory inside a symlinked directory
@@ -90,6 +61,18 @@ pub static FILE_SYMLINK: &str = "file_symlink";
 /// Name of a symlink pointing to a path that doesn't exist
 pub static BROKEN_SYMLINK: &str = "broken_symlink";
 
+/// Default reqwest client with some defaults set.
+#[fixture]
+pub fn reqwest_client() -> Client {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let reqwest_client = ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .no_proxy();
+    reqwest_client.build().unwrap()
+}
+
 /// Test fixture which creates a temporary directory with a few files and directories inside.
 /// The directories also contain files.
 #[fixture]
@@ -97,7 +80,6 @@ pub fn tmpdir() -> TempDir {
     let tmpdir = assert_fs::TempDir::new().expect("Couldn't create a temp dir for tests");
     let mut files = FILES.to_vec();
     files.extend_from_slice(HIDDEN_FILES);
-
     for file in &files {
         tmpdir
             .child(file)
@@ -155,22 +137,22 @@ pub fn tmpdir() -> TempDir {
     tmpdir
 }
 
-fn wait_for_port(port: u16) {
-    let start_wait = Instant::now();
-
-    while !port_check::is_port_reachable(format!("localhost:{port}")) {
-        sleep(Duration::from_millis(100));
-
-        if start_wait.elapsed().as_secs() > 1 {
-            panic!("Port {} is not reachable after 1 second", port);
-        }
-    }
-}
-
 /// Get a free port.
 #[fixture]
 pub fn port() -> u16 {
-    free_local_port().expect("Couldn't find a free local port")
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{Ipv6Addr, SocketAddr, TcpListener};
+
+    loop {
+        let ipv4 = TcpListener::bind(("127.0.0.1", 0)).expect("Couldn't find a free local port");
+        let port = ipv4.local_addr().unwrap().port();
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        socket.set_only_v6(true).unwrap();
+        let address = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+        if socket.bind(&address.into()).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// Run miniserve as a server; Start with a temporary directory, a free port and some
@@ -183,8 +165,7 @@ where
 {
     let port = port();
     let tmpdir = tmpdir();
-    let mut child = Command::cargo_bin("miniserve-axum")
-        .expect("Couldn't find test binary")
+    let mut child = Command::new(cargo::cargo_bin!("miniserve-axum"))
         .arg(tmpdir.path())
         .arg("-v")
         .arg("-p")
@@ -194,7 +175,6 @@ where
         .stderr(Stdio::piped())
         .spawn()
         .expect("Couldn't run test binary");
-
     let is_tls = args
         .into_iter()
         .any(|x| x.as_ref().to_str().unwrap().contains("tls"));
@@ -202,6 +182,7 @@ where
     // Read from stdout/stderr in the background and print/eprint everything read.
     // This dance is required to allow test output capturing to work as expected.
     // See https://github.com/rust-lang/rust/issues/92370 and https://github.com/rust-lang/rust/issues/90785
+
     let stdout = child.stdout.take().expect("Child process stdout is None");
     thread::spawn(move || {
         BufReader::new(stdout)
@@ -220,4 +201,56 @@ where
 
     wait_for_port(port);
     TestServer::new(port, tmpdir, child, is_tls)
+}
+
+/// Wait a max of 1s for the port to become available.
+fn wait_for_port(port: u16) {
+    let start_wait = Instant::now();
+
+    while !port_check::is_port_reachable(format!("localhost:{port}")) {
+        sleep(Duration::from_millis(100));
+
+        if start_wait.elapsed().as_secs() > 5 {
+            panic!("timeout waiting for port {port}");
+        }
+    }
+}
+
+pub struct TestServer {
+    port: u16,
+    tmpdir: TempDir,
+    child: Child,
+    is_tls: bool,
+}
+
+#[allow(dead_code)]
+impl TestServer {
+    pub fn new(port: u16, tmpdir: TempDir, child: Child, is_tls: bool) -> Self {
+        Self {
+            port,
+            tmpdir,
+            child,
+            is_tls,
+        }
+    }
+
+    pub fn url(&self) -> Url {
+        let protocol = if self.is_tls { "https" } else { "http" };
+        Url::parse(&format!("{}://localhost:{}", protocol, self.port)).unwrap()
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.tmpdir.path()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.child.kill().expect("Couldn't kill test server");
+        self.child.wait().unwrap();
+    }
 }

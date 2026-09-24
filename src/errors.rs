@@ -39,7 +39,7 @@ pub enum RuntimeError {
     MultipartError(String),
 
     /// Might occur during file upload
-    #[error("File already exists, and the overwrite_files option has not been set")]
+    #[error("File already exists, and the on_duplicate_files option is set to error out")]
     DuplicateFileError,
 
     /// Uploaded hash not correct
@@ -49,6 +49,9 @@ pub enum RuntimeError {
     /// Upload not allowed
     #[error("Upload not allowed to this directory")]
     UploadForbiddenError,
+
+    #[error("Removal not allowed in this directory")]
+    RmForbiddenError,
 
     /// Any error related to an invalid path (failed to retrieve entry name, unexpected entry type, etc)
     #[error("Invalid path\ncaused by: {0}")]
@@ -99,12 +102,14 @@ impl IntoResponse for RuntimeError {
                 res
             }
             other => {
+                let message = other.to_string();
                 let res = match other {
                     E::IoError(_, _) => S::INTERNAL_SERVER_ERROR,
                     E::MultipartError(_) => S::BAD_REQUEST,
                     E::DuplicateFileError => S::CONFLICT,
                     E::UploadHashMismatchError => S::BAD_REQUEST,
                     E::UploadForbiddenError => S::FORBIDDEN,
+                    E::RmForbiddenError => S::FORBIDDEN,
                     E::InvalidPathError(_) => S::BAD_REQUEST,
                     E::InsufficientPermissionsError(_) => S::FORBIDDEN,
                     E::ParseError(_, _) => S::BAD_REQUEST,
@@ -115,7 +120,7 @@ impl IntoResponse for RuntimeError {
                     // already handled InvalidHttpCredentials above
                     E::InvalidHttpCredentials => S::UNAUTHORIZED,
                 };
-                res.into_response()
+                (res, message).into_response()
             }
         }
     }

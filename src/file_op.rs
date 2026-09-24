@@ -14,11 +14,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_walkdir::WalkDir;
-use axum::body::Body;
 use axum::extract::{Multipart, Query, State, multipart::Field};
-use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, Uri, header};
-use axum::response::{Html, IntoResponse, Redirect};
-use bytesize::ByteSize;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Redirect};
 use futures::{StreamExt, TryStreamExt};
 use log::{error, info, warn};
 use serde::Deserialize;
@@ -31,7 +29,7 @@ use tokio::io::AsyncWriteExt;
 #[cfg(target_family = "unix")]
 use tokio::sync::RwLock;
 
-use crate::{ArchiveMethod, Breadcrumb, Entry, EntryType, ListingQueryParameters, page};
+use crate::DuplicateFile;
 use crate::{
     config::MiniserveConfig, errors::RuntimeError, file_utils::contains_symlink,
     file_utils::sanitize_path,
@@ -58,11 +56,6 @@ impl FileHash {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct DownloadQuery {
-    download: Option<ArchiveMethod>,
-}
-
 /// Get the recursively calculated dir size for a given dir
 ///
 /// Counts hardlinked files only once if the OS supports hardlinks.
@@ -78,24 +71,24 @@ pub async fn recursive_dir_size(dir: &Path) -> Result<u64, RuntimeError> {
     loop {
         match entries.next().await {
             Some(Ok(entry)) => {
-                if let Ok(metadata) = entry.metadata().await {
-                    if metadata.is_file() {
-                        // On Unix, we want to filter inodes that we've already seen so we get a
-                        // more accurate count of real size used on disk.
-                        #[cfg(target_family = "unix")]
-                        {
-                            let (device_id, inode) = (metadata.dev(), metadata.ino());
+                if let Ok(metadata) = entry.metadata().await
+                    && metadata.is_file()
+                {
+                    // On Unix, we want to filter inodes that we've already seen so we get a
+                    // more accurate count of real size used on disk.
+                    #[cfg(target_family = "unix")]
+                    {
+                        let (device_id, inode) = (metadata.dev(), metadata.ino());
 
-                            // Check if this file has been seen before based on its device ID and
-                            // inode number
-                            if seen_inodes.read().await.contains(&(device_id, inode)) {
-                                continue;
-                            } else {
-                                seen_inodes.write().await.insert((device_id, inode));
-                            }
+                        // Check if this file has been seen before based on its device ID and
+                        // inode number
+                        if seen_inodes.read().await.contains(&(device_id, inode)) {
+                            continue;
+                        } else {
+                            seen_inodes.write().await.insert((device_id, inode));
                         }
-                        total_size += metadata.len();
                     }
+                    total_size += metadata.len();
                 }
             }
             Some(Err(e)) => {
@@ -120,14 +113,33 @@ pub async fn recursive_dir_size(dir: &Path) -> Result<u64, RuntimeError> {
 /// Returns total bytes written to file.
 async fn save_file(
     field: &mut Field<'_>,
-    file_path: PathBuf,
-    overwrite_files: bool,
+    mut file_path: PathBuf,
+    on_duplicate_files: DuplicateFile,
     file_checksum: Option<&FileHash>,
     temporary_upload_directory: Option<&PathBuf>,
     expected_size: Option<u64>,
+    #[cfg(unix)] chmod: u16,
 ) -> Result<u64, RuntimeError> {
-    if !overwrite_files && file_path.exists() {
-        return Err(RuntimeError::DuplicateFileError);
+    if file_path.exists() {
+        match on_duplicate_files {
+            DuplicateFile::Error => return Err(RuntimeError::DuplicateFileError),
+            DuplicateFile::Overwrite => (),
+            DuplicateFile::Rename => {
+                let stem = file_path.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = file_path.extension().map(|s| s.to_string_lossy());
+                for i in 1.. {
+                    let name = match &ext {
+                        Some(ext) => format!("{stem}-{i}.{ext}"),
+                        None => format!("{stem}-{i}"),
+                    };
+                    let candidate = file_path.with_file_name(name);
+                    if !candidate.exists() {
+                        file_path = candidate;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     let temp_upload_directory = temporary_upload_directory.cloned();
@@ -179,7 +191,14 @@ async fn save_file(
     // new chunks from the websocket connection. The while loop reads
     // the file from the HTTP connection and writes it to disk or until
     // the stream from the multipart request is aborted.
-    while let Some(Ok(bytes)) = field.next().await {
+    while let Some(chunk) = field.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                save_upload_file_error = Some(RuntimeError::MultipartError(error.to_string()));
+                break;
+            }
+        };
         // Update hash with the streamed bytes, if requested
         if let Some(hasher) = stream_hasher.as_mut() {
             hasher.update(&bytes);
@@ -220,15 +239,15 @@ async fn save_file(
     }
 
     // Validate size if the client sent X-File-Size
-    if let Some(expected) = expected_size {
-        if written_len != expected {
-            warn!(
-                "Expected file size {} did not match received size {}. Treating as aborted upload.",
-                expected, written_len
-            );
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(RuntimeError::UploadHashMismatchError);
-        }
+    if let Some(expected) = expected_size
+        && written_len != expected
+    {
+        warn!(
+            "Expected file size {} did not match received size {}. Treating as aborted upload.",
+            expected, written_len
+        );
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(RuntimeError::UploadHashMismatchError);
     }
 
     // After fully writing, if a checksum was provided by client, compare against streamed hash.
@@ -274,17 +293,29 @@ async fn save_file(
         }
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file_path, std::fs::Permissions::from_mode(chmod.into()))
+            .await
+            .map_err(|e| {
+                RuntimeError::IoError(format!("Failed to chmod {chmod:o} {file_path:?}"), e)
+            })?;
+    }
+
     Ok(written_len)
 }
 
 struct HandleMultipartOpts<'a> {
-    overwrite_files: bool,
+    on_duplicate_files: DuplicateFile,
     allow_mkdir: bool,
     allow_hidden_paths: bool,
     allow_symlinks: bool,
     file_hash: Option<&'a FileHash>,
     upload_directory: Option<&'a PathBuf>,
     expected_size: Option<u64>,
+    #[cfg(unix)]
+    chmod: u16,
 }
 
 /// Handles a single field in a multipart form
@@ -294,13 +325,15 @@ async fn handle_multipart(
     opts: HandleMultipartOpts<'_>,
 ) -> Result<u64, RuntimeError> {
     let HandleMultipartOpts {
-        overwrite_files,
+        on_duplicate_files,
         allow_mkdir,
         allow_hidden_paths,
         allow_symlinks,
         file_hash,
         upload_directory,
         expected_size,
+        #[cfg(unix)]
+        chmod,
     } = opts;
     let field_name = field.name().expect("No name field found").to_string();
 
@@ -310,7 +343,7 @@ async fn handle_multipart(
         )),
         Ok(metadata) if !metadata.is_dir() => Err(RuntimeError::InvalidPathError(format!(
             "cannot upload file to {}, since it's not a directory",
-            &path.display()
+            path.display()
         ))),
         Ok(_) => Ok(()),
     }?;
@@ -391,6 +424,9 @@ async fn handle_multipart(
         )
     })?;
 
+    // Multipart quoted-string values escape backslashes; Actix decoded these before
+    // handing filenames to the upload handler.
+    let filename = filename.replace("\\\\", "\\");
     let filename_path = sanitize_path(Path::new(&filename), allow_hidden_paths)
         .ok_or_else(|| RuntimeError::InvalidPathError("Invalid file name to upload".to_string()))?;
 
@@ -408,10 +444,12 @@ async fn handle_multipart(
     save_file(
         &mut field,
         path.join(filename_path),
-        overwrite_files,
+        on_duplicate_files,
         file_hash,
         upload_directory,
         expected_size,
+        #[cfg(unix)]
+        chmod,
     )
     .await
 }
@@ -427,111 +465,15 @@ pub struct FileOpQueryParameters {
 /// server root directory. Any path which will go outside of this directory is considered
 /// invalid.
 /// This method returns future.
-pub async fn upload_file(
-    State(conf): State<Arc<MiniserveConfig>>,
-    Query(query): Query<FileOpQueryParameters>,
-    headers: axum::http::HeaderMap,
-    mut multipart: Multipart,
-) -> Result<axum::response::Response, RuntimeError> {
-    let upload_path = sanitize_path(&query.path, conf.show_hidden).ok_or_else(|| {
-        RuntimeError::InvalidPathError("Invalid value for 'path' parameter".to_string())
-    })?;
-    let app_root_dir = conf.path.canonicalize().map_err(|e| {
-        RuntimeError::IoError("Failed to resolve path served by miniserve".to_string(), e)
-    })?;
-
-    // Disallow paths outside of allowed directories
-    let upload_allowed = conf.allowed_upload_dir.is_empty()
-        || conf
-            .allowed_upload_dir
-            .iter()
-            .any(|s| upload_path.starts_with(s));
-
-    if !upload_allowed {
-        return Err(RuntimeError::UploadForbiddenError);
-    }
-
-    // Disallow the target path to go outside of the served directory
-    // The target directory shouldn't be canonicalized when it gets passed to
-    // handle_multipart so that it can check for symlinks if needed
-    let non_canonicalized_target_dir = app_root_dir.join(upload_path);
-    match non_canonicalized_target_dir.canonicalize() {
-        Ok(path) if !conf.no_symlinks => Ok(path),
-        Ok(path) if path.starts_with(&app_root_dir) => Ok(path),
-        _ => Err(RuntimeError::InvalidHttpRequestError(
-            "Invalid value for 'path' parameter".to_string(),
-        )),
-    }?;
-
-    let upload_directory = conf.temp_upload_directory.as_ref();
-    // Optional expected size header (provided by client)
-    let expected_size = headers
-        .get("X-File-Size")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    let file_hash = if let (Some(hash), Some(hash_function)) = (
-        headers.get("X-File-Hash").and_then(|h| h.to_str().ok()),
-        headers
-            .get("X-File-Hash-Function")
-            .and_then(|h| h.to_str().ok()),
-    ) {
-        match hash_function.to_ascii_uppercase().as_str() {
-            "SHA256" => Some(FileHash::SHA256(hash.to_string())),
-            "SHA512" => Some(FileHash::SHA512(hash.to_string())),
-            sha => {
-                return Err(RuntimeError::InvalidHttpRequestError(format!(
-                    "Invalid header value found for 'X-File-Hash-Function'. Supported values are SHA256 or SHA512. Found {sha}.",
-                )));
-            }
-        }
-    } else {
-        None
-    };
-
-    let hash_ref = file_hash.as_ref();
-    // Process multipart form
-    let mut sizes = Vec::new();
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| RuntimeError::MultipartError(e.to_string()))?
-    {
-        let size = handle_multipart(
-            field,
-            non_canonicalized_target_dir.clone(),
-            HandleMultipartOpts {
-                overwrite_files: conf.overwrite_files,
-                allow_mkdir: conf.mkdir_enabled,
-                allow_hidden_paths: conf.show_hidden,
-                allow_symlinks: !conf.no_symlinks,
-                file_hash: hash_ref,
-                upload_directory,
-                expected_size,
-            },
-        )
-        .await?;
-
-        sizes.push(size);
-    }
-
-    // Get the referer for redirect
-    let return_path = headers
-        .get(header::REFERER)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("/");
-
-    // Redirect to the referring page
-    Ok(Redirect::to(return_path).into_response())
-}
-
 pub async fn upload_file_handler(
     State(conf): State<Arc<MiniserveConfig>>,
     Query(query): Query<FileOpQueryParameters>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
+    if !conf.file_upload || conf.path.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     log::info!("Upload request received!");
 
     // Sanitize and validate target path
@@ -618,13 +560,15 @@ pub async fn upload_file_handler(
             field,
             non_canonicalized_target_dir.clone(),
             HandleMultipartOpts {
-                overwrite_files: conf.overwrite_files,
+                on_duplicate_files: conf.on_duplicate_files,
                 allow_mkdir: conf.mkdir_enabled,
                 allow_hidden_paths: conf.show_hidden,
                 allow_symlinks: !conf.no_symlinks,
                 file_hash: hash_ref,
                 upload_directory,
                 expected_size,
+                #[cfg(unix)]
+                chmod: conf.upload_chmod,
             },
         )
         .await
@@ -642,216 +586,61 @@ pub async fn upload_file_handler(
     axum::response::Redirect::to(return_path).into_response()
 }
 
-pub async fn file_and_directory_handler(
-    uri: Uri,
-    Query(download_query): Query<DownloadQuery>,
-    State(config): State<Arc<MiniserveConfig>>,
-) -> impl IntoResponse {
-    let path_str = uri.path();
-    let decoded_path = percent_encoding::percent_decode_str(path_str)
-        .decode_utf8()
-        .unwrap_or_default();
-
-    // Remove leading slash and join with served directory
-    let relative_path = decoded_path.strip_prefix('/').unwrap_or(&decoded_path);
-    let full_path = config.path.join(relative_path);
-
-    if !full_path.exists() {
-        return (StatusCode::NOT_FOUND, "File not found").into_response();
+pub async fn rm_file_handler(
+    State(conf): State<Arc<MiniserveConfig>>,
+    Query(query): Query<FileOpQueryParameters>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !conf.rm_enabled || conf.path.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
     }
-
-    if full_path.is_file() {
-        // Serve file
-        match fs::read(&full_path).await {
-            Ok(contents) => {
-                // Simple content type detection
-                let content_type = if path_str.ends_with(".html") {
-                    "text/html"
-                } else if path_str.ends_with(".css") {
-                    "text/css"
-                } else if path_str.ends_with(".js") {
-                    "application/javascript"
-                } else if path_str.ends_with(".png") {
-                    "image/png"
-                } else if path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") {
-                    "image/jpeg"
-                } else {
-                    "application/octet-stream"
-                };
-
-                let headers = [(axum::http::header::CONTENT_TYPE, content_type)];
-                (headers, contents).into_response()
-            }
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not read file").into_response(),
-        }
-    } else if full_path.is_dir() {
-        // Check if this is a download request
-        if let Some(archive_method) = download_query.download {
-            // Handle archive download
-            if !archive_method.is_enabled(
-                config.tar_enabled,
-                config.tar_gz_enabled,
-                config.zip_enabled,
-            ) {
-                return (StatusCode::FORBIDDEN, "Archive creation is disabled.").into_response();
-            }
-
-            log::info!(
-                "Creating {} archive for path: {:?}",
-                archive_method,
-                full_path
-            );
-            log::info!("Full path exists: {}", full_path.exists());
-            log::info!("Full path is_dir: {}", full_path.is_dir());
-            log::info!("Full path file_name: {:?}", full_path.file_name());
-            log::info!("Full path as string: {}", full_path.display());
-
-            let file_name = format!(
-                "{}.{}",
-                full_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("archive"),
-                archive_method.extension()
-            );
-
-            // Create archive synchronously in memory for debugging
-            let mut buffer = Vec::new();
-            match archive_method.create_archive(&full_path, config.no_symlinks, &mut buffer) {
-                Ok(()) => {
-                    log::info!("Archive created successfully! Size: {} bytes", buffer.len());
-
-                    let mut response = Response::new(Body::from(buffer));
-                    response.headers_mut().insert(
-                        "content-type",
-                        HeaderValue::from_str(&archive_method.content_type()).unwrap_or_else(
-                            |_| HeaderValue::from_static("application/octet-stream"),
-                        ),
-                    );
-                    response.headers_mut().insert(
-                        "content-transfer-encoding",
-                        HeaderValue::from_static("binary"),
-                    );
-                    response.headers_mut().insert(
-                        "content-disposition",
-                        HeaderValue::from_str(&format!("attachment; filename={:?}", file_name))
-                            .unwrap(),
-                    );
-
-                    return response;
-                }
-                Err(err) => {
-                    log::error!("Archive creation failed: {:?}", err);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Archive creation failed: {}", err),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            // Generate directory listing
-            match generate_directory_listing(&full_path, &uri, &config).await {
-                Ok(html) => Html(html.into_string()).into_response(),
-                Err(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Could not read directory",
-                )
-                    .into_response(),
-            }
-        }
+    let Some(path) = sanitize_path(&query.path, conf.show_hidden) else {
+        return RuntimeError::InvalidPathError("Invalid value for 'path' parameter".into())
+            .into_response();
+    };
+    if path.as_os_str().is_empty() {
+        return RuntimeError::RmForbiddenError.into_response();
+    }
+    if !conf.allowed_rm_dir.is_empty()
+        && !conf
+            .allowed_rm_dir
+            .iter()
+            .any(|allowed| path.starts_with(allowed))
+    {
+        return RuntimeError::RmForbiddenError.into_response();
+    }
+    let Ok(root) = conf.path.canonicalize() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let target = root.join(&path);
+    let Some(parent) = target.parent() else {
+        return RuntimeError::RmForbiddenError.into_response();
+    };
+    let Ok(canonical_parent) = parent.canonicalize() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if conf.no_symlinks
+        && (!canonical_parent.starts_with(&root) || contains_symlink(&target).unwrap_or(true))
+    {
+        return RuntimeError::RmForbiddenError.into_response();
+    }
+    let target = canonical_parent.join(target.file_name().unwrap_or_default());
+    let Ok(metadata) = fs::symlink_metadata(&target).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = if metadata.is_dir() {
+        fs::remove_dir_all(&target).await
     } else {
-        (StatusCode::NOT_FOUND, "Not found").into_response()
+        fs::remove_file(&target).await
+    };
+    if let Err(error) = result {
+        return RuntimeError::IoError(format!("Failed to remove {path:?}"), error).into_response();
     }
-}
-
-pub async fn generate_directory_listing(
-    dir_path: &Path,
-    uri: &Uri,
-    config: &Arc<MiniserveConfig>,
-) -> Result<maud::Markup, std::io::Error> {
-    let mut entries = Vec::new();
-    let mut dir_entries = fs::read_dir(dir_path).await?;
-
-    while let Some(entry) = dir_entries.next_entry().await? {
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = entry.metadata().await.ok();
-
-        let entry_type = if entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false)
-        {
-            EntryType::Directory
-        } else {
-            EntryType::File
-        };
-
-        let size = metadata
-            .as_ref()
-            .filter(|m| m.is_file())
-            .map(|m| ByteSize::b(m.len()));
-
-        let last_modification_date = metadata.as_ref().and_then(|m| m.modified().ok());
-
-        let link = if uri.path().ends_with('/') {
-            format!("{}{}", uri.path(), file_name)
-        } else {
-            format!("{}/{}", uri.path(), file_name)
-        };
-
-        entries.push(Entry {
-            name: file_name,
-            entry_type,
-            link,
-            size,
-            last_modification_date,
-            symlink_info: None,
-        });
-    }
-
-    // Create breadcrumbs
-    let path_components: Vec<&str> = uri
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut breadcrumbs = vec![Breadcrumb {
-        name: "Home".to_string(),
-        link: "/".to_string(),
-    }];
-
-    let mut current_path = String::new();
-    for component in path_components {
-        current_path.push('/');
-        current_path.push_str(component);
-        breadcrumbs.push(Breadcrumb {
-            name: component.to_string(),
-            link: current_path.clone(),
-        });
-    }
-
-    // Mark the last breadcrumb as current (don't make it a link)
-    if let Some(last) = breadcrumbs.last_mut() {
-        last.link = ".".to_string();
-    }
-
-    let is_root = uri.path() == "/" || uri.path().is_empty();
-    let encoded_dir = uri.path().to_string();
-    let query_params = ListingQueryParameters::default();
-
-    // Use the proper miniserve page render function
-    Ok(page(
-        entries,
-        None, // readme
-        uri,
-        is_root,
-        query_params,
-        &breadcrumbs,
-        &encoded_dir,
-        config,
-        None, // current_user
-    ))
+    Redirect::to(
+        headers
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("/"),
+    )
+    .into_response()
 }

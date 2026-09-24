@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{borrow::Cow, time::SystemTime};
 
 use axum::http::{StatusCode, Uri};
 use chrono::{DateTime, Local};
@@ -10,10 +10,15 @@ use fast_qr::{
     qr::QRCodeError,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use percent_encoding::utf8_percent_encode;
 use strum::{Display, IntoEnumIterator};
 
-use crate::listing::{Breadcrumb, Entry, ListingQueryParameters, SortingMethod, SortingOrder};
-use crate::{CurrentUser, consts};
+use crate::auth::CurrentUser;
+use crate::consts;
+use crate::listing::{
+    Breadcrumb, Entry, ListingQueryParameters, SortingMethod, SortingOrder,
+    percent_encode_sets::COMPONENT,
+};
 use crate::{MiniserveConfig, archive::ArchiveMethod};
 
 #[allow(clippy::too_many_arguments)]
@@ -29,13 +34,19 @@ pub fn page(
     conf: &MiniserveConfig,
     current_user: Option<&CurrentUser>,
 ) -> Markup {
+    let (sort_method, sort_order, search) = (
+        query_params.sort,
+        query_params.order,
+        query_params.search.as_deref(),
+    );
+
     // If query_params.raw is true, we want render a minimal directory listing
     if query_params.raw.is_some() && query_params.raw.unwrap() {
-        return raw(entries, is_root, conf);
+        return raw(entries, search, is_root, conf);
     }
 
-    let upload_route = format!("{}/upload", &conf.route_prefix);
-    let (sort_method, sort_order) = (query_params.sort, query_params.order);
+    let upload_route = format!("{}/upload", conf.route_prefix);
+    let rm_route = format!("{}/rm", conf.route_prefix);
 
     let upload_action = build_upload_action(&upload_route, encoded_dir, sort_method, sort_order);
     let mkdir_action = build_mkdir_action(&upload_route, encoded_dir);
@@ -47,6 +58,17 @@ pub fn page(
             .allowed_upload_dir
             .iter()
             .any(|x| encoded_dir.starts_with(&format!("/{x}")));
+    let rm_allowed = conf.allowed_rm_dir.is_empty()
+        || conf
+            .allowed_rm_dir
+            .iter()
+            .any(|x| encoded_dir.starts_with(&format!("/{x}")));
+
+    // OR with other conditions in the future if more actions are added
+    let show_actions = conf.rm_enabled && rm_allowed;
+    let actions_conf = show_actions.then(|| ActionsConf {
+        rm_route: &rm_route,
+    });
 
     html! {
         (DOCTYPE)
@@ -78,52 +100,71 @@ pub fn page(
                 }
                 div.container {
                     span #top { }
-                    h1.title dir="ltr" {
-                        @for el in breadcrumbs {
-                            @if el.link == "." {
-                                // wrapped in span so the text doesn't shift slightly when it turns into a link
-                                span { bdi { (el.name) } }
-                            } @else {
-                                a href=(parametrized_link(&el.link, sort_method, sort_order, false)) {
-                                    bdi { (el.name) }
+                    div.title-search-box {
+                        h1.title dir="ltr" {
+                            @for el in breadcrumbs {
+                                @if el.link == "." {
+                                    // wrapped in span so the text doesn't shift slightly when it turns into a link
+                                    span { bdi { (el.name) } }
+                                } @else {
+                                    a href=(parametrized_link(&el.link, sort_method, sort_order, false, search)) {
+                                        bdi { (el.name) }
+                                    }
                                 }
+                                "/"
                             }
-                            "/"
+                        }
+                        div.search-box {
+                            form id="search" method="GET" {
+                                input type="text" name="search" value=(search.unwrap_or_default()) placeholder="Search..." {}
+                                button type="submit" { "Search" }
+                            }
                         }
                     }
                     div.toolbar {
                         @if conf.tar_enabled || conf.tar_gz_enabled || conf.zip_enabled {
-                            div.download {
-                                @for archive_method in ArchiveMethod::iter() {
-                                    @if archive_method.is_enabled(conf.tar_enabled, conf.tar_gz_enabled, conf.zip_enabled) {
-                                        (archive_button(archive_method, sort_method, sort_order))
+                            div.tool_row.download_tools {
+                                div.tool data-tool="download" {
+                                    @for archive_method in ArchiveMethod::iter() {
+                                        @if archive_method.is_enabled(conf.tar_enabled, conf.tar_gz_enabled, conf.zip_enabled) {
+                                            (archive_button(archive_method, sort_method, sort_order))
+                                        }
                                     }
                                 }
                             }
                         }
-                        div.toolbar_box_group {
+
+                        div.tool_row.upload_tools {
                             @if conf.file_upload && upload_allowed {
-                                div.toolbar_box {
-                                    form id="file_submit" action=(upload_action) method="POST" enctype="multipart/form-data" {
-                                        p { "Select a file to upload or drag it anywhere into the window" }
-                                        div {
-                                            @match &conf.uploadable_media_type {
-                                                Some(accept) => {input #file-input accept=(accept) type="file" name="file_to_upload" required="" multiple {}},
-                                                None => {input #file-input type="file" name="file_to_upload" required="" multiple {}}
-                                            }
-                                            button type="submit" { "Upload file" }
+                                form.tool id="file_submit" data-tool="upload" action=(upload_action) method="POST" enctype="multipart/form-data" {
+                                    p { "Select a file to upload or drag it anywhere into the window" }
+                                    div {
+                                        @match &conf.uploadable_media_type {
+                                            Some(accept) => {input #file-input accept=(accept) type="file" name="file_to_upload" required="" multiple {}},
+                                            None => {input #file-input type="file" name="file_to_upload" required="" multiple {}}
                                         }
+                                        button type="submit" title="Upload File" { "Upload file" }
                                     }
                                 }
                             }
                             @if conf.mkdir_enabled && upload_allowed {
-                                div.toolbar_box {
-                                    form id="mkdir" action=(mkdir_action) method="POST" enctype="multipart/form-data" {
-                                        p { "Specify a directory name to create" }
-                                        div.toolbar_box {
-                                            input type="text" name="mkdir" required="" placeholder="Directory name" {}
-                                            button type="submit" { "Create directory" }
-                                        }
+                                form.tool id="mkdir" data-tool="mkdir" action=(mkdir_action) method="POST" enctype="multipart/form-data" {
+                                    p { "Specify a directory name to create" }
+                                    div {
+                                        input type="text" name="mkdir" required="" placeholder="Directory name" {}
+                                        button type="submit" title="Create directory" { "Create directory" }
+                                    }
+                                }
+                            }
+                            @if conf.pastebin_enabled && upload_allowed {
+                                form.tool id="pastebin" data-tool="pastebin" {
+                                    p { "Create a text file in the current directory, a random filename will be generated, or you may specify one." }
+                                    div {
+                                        textarea #pastebin_content name="paste_content" title="Text content" required="" { }
+                                    }
+                                    div {
+                                        input type="text" name="paste_filename" title="Filename" placeholder="Filename (Optional)" autocomplete="off" {}
+                                        button type="submit" title="Create file" { "Create file" }
                                     }
                                 }
                             }
@@ -131,17 +172,20 @@ pub fn page(
                     }
                     table {
                         thead {
-                            th.name { (build_link("name", "Name", sort_method, sort_order)) }
-                            th.size { (build_link("size", "Size", sort_method, sort_order)) }
-                            th.date { (build_link("date", "Last modification", sort_method, sort_order)) }
+                            th.name { (sortable_title("name", "Name", sort_method, sort_order, search)) }
+                            th.size { (sortable_title("size", "Size", sort_method, sort_order, search)) }
+                            th.date { (sortable_title("date", "Last modification", sort_method, sort_order, search)) }
+                            @if show_actions {
+                                th.actions { span { "Actions" } }
+                            }
                         }
                         tbody {
                             @if !is_root {
                                 tr {
-                                    td colspan="3" {
+                                    td colspan=(3 + show_actions as usize) {
                                         p {
                                             span.root-chevron { (chevron_left()) }
-                                            a.root href=(parametrized_link("../", sort_method, sort_order, false)) {
+                                            a.root href=(parametrized_link("../", sort_method, sort_order, false, search)) {
                                                 "Parent directory"
                                             }
                                         }
@@ -149,7 +193,7 @@ pub fn page(
                                 }
                             }
                             @for entry in entries {
-                                (entry_row(entry, sort_method, sort_order, false, conf.show_exact_bytes))
+                                (entry_row(entry, sort_method, sort_order, false, search, conf.show_exact_bytes, actions_conf, &conf.route_prefix))
                             }
                         }
                     }
@@ -166,7 +210,8 @@ pub fn page(
                     }
                     div.footer {
                         @if conf.show_wget_footer {
-                            (wget_footer(abs_uri, conf.title.as_deref(), current_user.map(|x| &*x.name)))
+                            (wget_footer(abs_uri, conf.title.as_deref(), current_user.map(|x| &*x.name),
+                                conf.file_external_url.as_deref()))
                         }
                         @if !conf.hide_version_footer {
                             (version_footer())
@@ -213,7 +258,12 @@ pub fn page(
 }
 
 /// Renders the file listing
-pub fn raw(entries: Vec<Entry>, is_root: bool, conf: &MiniserveConfig) -> Markup {
+pub fn raw(
+    entries: Vec<Entry>,
+    search: Option<&str>,
+    is_root: bool,
+    conf: &MiniserveConfig,
+) -> Markup {
     html! {
         (DOCTYPE)
         html {
@@ -229,7 +279,7 @@ pub fn raw(entries: Vec<Entry>, is_root: bool, conf: &MiniserveConfig) -> Markup
                             tr {
                                 td colspan="3" {
                                     p {
-                                        a.root href=(parametrized_link("../", None, None, true)) {
+                                        a.root href=(parametrized_link("../", None, None, true, search)) {
                                             ".."
                                         }
                                     }
@@ -237,7 +287,7 @@ pub fn raw(entries: Vec<Entry>, is_root: bool, conf: &MiniserveConfig) -> Markup
                             }
                         }
                         @for entry in entries {
-                            (entry_row(entry, None, None, true, conf.show_exact_bytes))
+                            (entry_row(entry, None, None, true, search, conf.show_exact_bytes, None, &conf.route_prefix))
                         }
                     }
                 }
@@ -277,7 +327,12 @@ fn version_footer() -> Markup {
     }
 }
 
-fn wget_footer(abs_path: &Uri, root_dir_name: Option<&str>, current_user: Option<&str>) -> Markup {
+fn wget_footer(
+    abs_path: &Uri,
+    root_dir_name: Option<&str>,
+    current_user: Option<&str>,
+    file_external_url: Option<&str>,
+) -> Markup {
     fn escape_apostrophes(x: &str) -> String {
         x.replace('\'', "'\"'\"'")
     }
@@ -302,9 +357,16 @@ fn wget_footer(abs_path: &Uri, root_dir_name: Option<&str>, current_user: Option
         None => String::new(),
     };
 
+    // Add the -H option to span hosts when serving files from another instance
+    let span_hosts_option = if file_external_url.is_some() {
+        " -H"
+    } else {
+        " -nH"
+    };
+
     let encoded_abs_path = abs_path.to_string().replace('\'', "%27");
     let command = format!(
-        "wget -rcnHp -R 'index.html*'{cut_dirs}{user_params} '{encoded_abs_path}?raw=true'"
+        "wget -rcnp -R 'index.html*'{span_hosts_option}{cut_dirs}{user_params} '{encoded_abs_path}?raw=true'"
     );
     let click_to_copy = format!("navigator.clipboard.writeText(\"{command}\")");
 
@@ -325,10 +387,10 @@ fn build_upload_action(
 ) -> String {
     let mut upload_action = format!("{upload_route}?path={encoded_dir}");
     if let Some(sorting_method) = sort_method {
-        upload_action = format!("{}&sort={}", upload_action, &sorting_method);
+        upload_action = format!("{}&sort={}", upload_action, sorting_method);
     }
     if let Some(sorting_order) = sort_order {
-        upload_action = format!("{}&order={}", upload_action, &sorting_order);
+        upload_action = format!("{}&order={}", upload_action, sorting_order);
     }
 
     upload_action
@@ -343,6 +405,7 @@ const THEME_PICKER_CHOICES: &[(&str, &str)] = &[
     ("Default (light/dark)", "default"),
     ("Squirrel (light)", "squirrel"),
     ("Arch Linux (dark)", "archlinux"),
+    ("Ayu Dark (dark)", "ayu_dark"),
     ("Zenburn (dark)", "zenburn"),
     ("Monokai (dark)", "monokai"),
 ];
@@ -353,6 +416,8 @@ pub enum ThemeSlug {
     Squirrel,
     #[strum(serialize = "archlinux")]
     Archlinux,
+    #[strum(serialize = "ayu_dark")]
+    AyuDark,
     #[strum(serialize = "zenburn")]
     Zenburn,
     #[strum(serialize = "monokai")]
@@ -364,6 +429,7 @@ impl ThemeSlug {
         match self {
             Self::Squirrel => grass::include!("data/themes/squirrel.scss"),
             Self::Archlinux => grass::include!("data/themes/archlinux.scss"),
+            Self::AyuDark => grass::include!("data/themes/ayu_dark.scss"),
             Self::Zenburn => grass::include!("data/themes/zenburn.scss"),
             Self::Monokai => grass::include!("data/themes/monokai.scss"),
         }
@@ -435,7 +501,7 @@ fn archive_button(
     } else {
         format!(
             "{}&download={}",
-            parametrized_link("", sort_method, sort_order, false),
+            parametrized_link("", sort_method, sort_order, false, None),
             archive_method
         )
     };
@@ -464,51 +530,75 @@ fn parametrized_link(
     sort_method: Option<SortingMethod>,
     sort_order: Option<SortingOrder>,
     raw: bool,
+    search: Option<&str>,
 ) -> String {
+    let mut query: Vec<Cow<'static, str>> = Vec::new();
+
     if raw {
-        return format!("{}?raw=true", make_link_with_trailing_slash(link));
+        query.push("raw=true".into());
+    } else if let Some(method) = sort_method
+        && let Some(order) = sort_order
+    {
+        query.push(format!("sort={method}").into());
+        query.push(format!("order={order}").into());
     }
 
-    if let Some(method) = sort_method {
-        if let Some(order) = sort_order {
-            let parametrized_link = format!(
-                "{}?sort={}&order={}",
-                make_link_with_trailing_slash(link),
-                method,
-                order,
-            );
-
-            return parametrized_link;
-        }
+    if let Some(search) = search
+        && !search.is_empty()
+    {
+        query.push(format!("search={}", utf8_percent_encode(search, COMPONENT)).into());
     }
 
-    make_link_with_trailing_slash(link)
+    if query.is_empty() {
+        make_link_with_trailing_slash(link)
+    } else {
+        format!(
+            "{}?{}",
+            make_link_with_trailing_slash(link),
+            query.join("&")
+        )
+    }
 }
 
 /// Partial: table header link
-fn build_link(
+fn sortable_title(
     name: &str,
     title: &str,
     sort_method: Option<SortingMethod>,
     sort_order: Option<SortingOrder>,
+    search: Option<&str>,
 ) -> Markup {
-    let mut link = format!("?sort={name}&order=asc");
+    let mut query_items = Vec::new();
     let mut help = format!("Sort by {name} in ascending order");
     let mut chevron = chevron_down();
     let mut class = "";
 
-    if let Some(method) = sort_method {
-        if method.to_string() == name {
-            class = "active";
-            if let Some(order) = sort_order {
-                if order.to_string() == "asc" {
-                    link = format!("?sort={name}&order=desc");
-                    help = format!("Sort by {name} in descending order");
-                    chevron = chevron_up();
-                }
-            }
+    let order = if let Some(method) = sort_method
+        && method.to_string() == name
+    {
+        class = "active";
+        if let Some(order) = sort_order
+            && order.to_string() == "asc"
+        {
+            help = format!("Sort by {name} in descending order");
+            chevron = chevron_up();
+            "desc"
+        } else {
+            "asc"
         }
+    } else {
+        "asc"
     };
+
+    query_items.push(format!("sort={name}&order={order}"));
+
+    if let Some(search) = search
+        && !search.is_empty()
+    {
+        query_items.push(format!("search={}", utf8_percent_encode(search, COMPONENT)));
+    }
+
+    let link = format!("?{}", query_items.join("&"));
 
     html! {
         span class=(class) {
@@ -518,13 +608,35 @@ fn build_link(
     }
 }
 
+/// Partial: rm form
+fn rm_form(rm_route: &str, encoded_path: &str, prefix: &str) -> Markup {
+    let stripped_path = encoded_path.strip_prefix(prefix).unwrap_or(encoded_path);
+    let rm_action = format!("{rm_route}?path={stripped_path}");
+
+    html! {
+        form class="rm_form" action=(rm_action) method="POST" {
+            button type="submit" title="Delete" { "✗" }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ActionsConf<'a> {
+    /// Route prefix for file removal POST requests.
+    rm_route: &'a str,
+}
+
 /// Partial: row for an entry
+#[allow(clippy::too_many_arguments)]
 fn entry_row(
     entry: Entry,
     sort_method: Option<SortingMethod>,
     sort_order: Option<SortingOrder>,
     raw: bool,
+    search: Option<&str>,
     show_exact_bytes: bool,
+    actions_conf: Option<ActionsConf>,
+    route_prefix: &str,
 ) -> Markup {
     html! {
         @let entry_type = entry.entry_type.clone();
@@ -533,13 +645,13 @@ fn entry_row(
                 p {
                     @if entry.is_dir() {
                         @if let Some(ref symlink_dest) = entry.symlink_info {
-                            a.symlink href=(parametrized_link(&entry.link, sort_method, sort_order, raw)) {
+                            a.symlink href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search)) {
                                 (entry.name) "/"
                                 span.symlink-symbol { }
                                 a.directory {(symlink_dest) "/"}
                             }
                         }@else {
-                            a.directory href=(parametrized_link(&entry.link, sort_method, sort_order, raw)) {
+                            a.directory href=(parametrized_link(&entry.link, sort_method, sort_order, raw, search)) {
                                 (entry.name) "/"
                             }
                         }
@@ -564,13 +676,13 @@ fn entry_row(
                                     }
                                 }@else {
                                     span.mobile-info.size {
-                                        (build_link("size", &format!("{}", size), sort_method, sort_order))
+                                        (sortable_title("size", &format!("{size}"), sort_method, sort_order, search))
+                                    }
                                 }
                             }
                             @if let Some(modification_timer) = humanize_systemtime(entry.last_modification_date) {
                                 span.mobile-info.history {
-                                    (build_link("date", &modification_timer, sort_method, sort_order))
-                                    }
+                                    (sortable_title("date", &modification_timer, sort_method, sort_order, search))
                                 }
                             }
                         }
@@ -596,6 +708,11 @@ fn entry_row(
                     span.history {
                         (modification_timer)
                     }
+                }
+            }
+            @if let Some(conf) = actions_conf {
+                td.actions-cell {
+                    (rm_form(conf.rm_route, &entry.link, route_prefix))
                 }
             }
         }
@@ -667,6 +784,20 @@ fn page_header(
                     addEventListener("load", loadColorScheme);
                     // load saved theme when local storage is changed (synchronize between tabs)
                     addEventListener("storage", loadColorScheme);
+
+                    // handle search form submission
+                    addEventListener("load", function() {
+                        const searchForm = document.getElementById('search');
+                        if (searchForm) {
+                            searchForm.addEventListener('submit', function(event) {
+                                event.preventDefault();
+                                const currentParams = new URLSearchParams(window.location.search);
+                                const searchInput = event.target.elements.search;
+                                currentParams.set('search', searchInput.value);
+                                window.location.search = currentParams.toString();
+                            });
+                        }
+                    });
                 "#))
             }
 
@@ -876,7 +1007,6 @@ fn page_header(
 
                         document.querySelector('input[type="file"]').addEventListener('change', async (e) => {
                           const file = e.target.files[0];
-                          const hash = await hashFile(file);
                         });
 
                         async function get256FileHash(file) {
@@ -933,7 +1063,12 @@ fn page_header(
 
                                 // Upload the single file in a multipart request.
                                 return new Promise(async (resolve, reject) => {
-                                    const fileHash = await get256FileHash(file);
+                                    // File hash calculation may fail at times:
+                                    //   1. `crypto.subtle` is not available in nonsecure context (e.g. non-HTTPS LAN).
+                                    //      See https://developer.mozilla.org/en-US/docs/Web/API/Crypto/subtle
+                                    //   2. For files larger than 2GB, Firefox will refuse to calculate the SHA-256 value,
+                                    //      while Chrome will refuse to create a ArrayBuffer (#1541).
+                                    const fileHash = await get256FileHash(file).catch(() => "");
                                     const xhr = new XMLHttpRequest();
                                     const formData = new FormData();
                                     formData.append('file', file);
@@ -1012,13 +1147,70 @@ fn page_header(
                                         xhr.addEventListener("abort", onAbort);
                                         xhr.upload.addEventListener('progress', onProgress);
                                         xhr.open('post', form.getAttribute("action"), true);
-                                        xhr.setRequestHeader('X-File-Hash', fileHash);
-                                        xhr.setRequestHeader('X-File-Hash-Function', 'SHA256');
-                                        xhr.setRequestHeader('X-File-Size', String(file.size));
+                                        if (fileHash) {
+                                            xhr.setRequestHeader('X-File-Hash', fileHash);
+                                            xhr.setRequestHeader('X-File-Hash-Function', 'SHA256');
+                                        }
                                         xhr.send(formData);
                                     }
                                 })
                             }
+                        }
+
+                        // Bind pastebin submission to create a text/plain blob which is injected
+                        // into the upload input then submitted. A title is automatically generated
+                        // if none is given.
+                        const fileUploadForm = document.querySelector('#file_submit');
+                        const fileUploadInput = document.querySelector('#file_submit input[type=file]');
+                        const pastebinForm = document.querySelector('form#pastebin');
+                        if (pastebinForm) {
+                            const pastebinFilename = pastebinForm.querySelector('input[name=paste_filename]');
+                            const pastebinContent = pastebinForm.querySelector('textarea');
+                            pastebinContent.addEventListener('keydown', (event) => {
+                                // common convenience of ctrl-enter to submit
+                                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                                    event.preventDefault();
+                                    event.target.form.requestSubmit();
+                                }
+                            });
+
+                            pastebinForm.addEventListener('submit', (event) => {
+                                // The pastebin form is "dead" and should not cause any page-submit
+                                // events. We capture the pastebin form content, convert it into a
+                                // in-memory blob, then pass that blob to the regular fileUpload form
+                                // for submission, as if a user and selected a real file.
+                                event.preventDefault();
+                                const text = pastebinContent.value;
+                                const title = ((inputValue) => {
+                                    const title = inputValue.trim();
+                                    if (title.length === 0) {
+                                        let suffix;
+                                        if (crypto.randomUUID !== undefined) {
+                                            suffix = crypto.randomUUID().substring(0,6);
+                                        } else {
+                                            // neither HTTPS nor "localhost"
+                                            suffix = Date.now().toString(16).slice(-6);
+                                        }
+                                        return `paste-${suffix}.txt`;
+                                    } else {
+                                        // use given extension if one is present, otherwise make it
+                                        // .txt. We're quite liberal in what we consider an extension,
+                                        // any number of alpha-numeric after a dot.
+                                        if (/\.[0-9a-z]+$/i.test(title)) {
+                                            return title;
+                                        } else {
+                                            return `${title}.txt`;
+                                        }
+                                    }
+                                })(pastebinFilename.value);
+                                // Package text as a file and submit
+                                const blob = new Blob([text], {type: 'text/plain'});
+                                const file = new File([blob], title, {type: 'text/plain'});
+                                const container = new DataTransfer();
+                                container.items.add(file);
+                                fileUploadInput.files = container.files;
+                                fileUploadForm.submit();
+                            });
                         }
                     }
                     "#))
@@ -1087,7 +1279,7 @@ mod tests {
 
     fn to_html(wget_part: &str) -> String {
         format!(
-            r#"<div class="downloadDirectory"><p>Download folder:</p><a class="cmd" title="Click to copy!" style="cursor: pointer;" onclick="navigator.clipboard.writeText(&quot;wget -rcnHp -R 'index.html*' {wget_part}/?raw=true'&quot;)">wget -rcnHp -R 'index.html*' {wget_part}/?raw=true'</a></div>"#
+            r#"<div class="downloadDirectory"><p>Download folder:</p><a class="cmd" title="Click to copy!" style="cursor: pointer;" onclick="navigator.clipboard.writeText(&quot;wget -rcnp -R 'index.html*' {wget_part}/?raw=true'&quot;)">wget -rcnp -R 'index.html*' {wget_part}/?raw=true'</a></div>"#
         )
     }
 
@@ -1097,8 +1289,9 @@ mod tests {
 
     #[test]
     fn test_wget_footer_trivial() {
-        let to_be_tested: String = wget_footer(&uri("https://github.com/"), None, None).into();
-        let expected = to_html("-P 'github.com' 'https://github.com");
+        let to_be_tested: String =
+            wget_footer(&uri("https://github.com/"), None, None, None).into();
+        let expected = to_html("-nH -P 'github.com' 'https://github.com");
         assert_eq!(to_be_tested, expected);
     }
 
@@ -1108,9 +1301,10 @@ mod tests {
             &uri("https://github.com/svenstaro/miniserve/"),
             Some("Miniserve"),
             None,
+            None,
         )
         .into();
-        let expected = to_html("--cut-dirs=1 'https://github.com/svenstaro/miniserve");
+        let expected = to_html("-nH --cut-dirs=1 'https://github.com/svenstaro/miniserve");
         assert_eq!(to_be_tested, expected);
     }
 
@@ -1120,10 +1314,11 @@ mod tests {
             &uri("http://1und1.de/"),
             Some("1&1 - Willkommen!!!"),
             Some("Marcell D'Avis"),
+            None,
         )
         .into();
         let expected = to_html(
-            "-P '1&amp;1 - Willkommen!!!' --ask-password --user 'Marcell D'&quot;'&quot;'Avis' 'http://1und1.de",
+            "-nH -P '1&amp;1 - Willkommen!!!' --ask-password --user 'Marcell D'&quot;'&quot;'Avis' 'http://1und1.de",
         );
         assert_eq!(to_be_tested, expected);
     }
@@ -1134,18 +1329,50 @@ mod tests {
             &uri("http://127.0.0.1:1234/geheime_dokumente.php/"),
             Some("Streng Geheim!!!"),
             Some("uøý`¶'7ÅÛé"),
+            None,
         )
         .into();
         let expected = to_html(
-            "--ask-password --user 'uøý`¶'&quot;'&quot;'7ÅÛé' 'http://127.0.0.1:1234/geheime_dokumente.php",
+            "-nH --ask-password --user 'uøý`¶'&quot;'&quot;'7ÅÛé' 'http://127.0.0.1:1234/geheime_dokumente.php",
         );
         assert_eq!(to_be_tested, expected);
     }
 
     #[test]
     fn test_wget_footer_ip() {
-        let to_be_tested: String = wget_footer(&uri("http://127.0.0.1:420/"), None, None).into();
-        let expected = to_html("-P '127.0.0.1:420' 'http://127.0.0.1:420");
+        let to_be_tested: String =
+            wget_footer(&uri("http://127.0.0.1:420/"), None, None, None).into();
+        let expected = to_html("-nH -P '127.0.0.1:420' 'http://127.0.0.1:420");
         assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_wget_footer_externalurl() {
+        let to_be_tested: String = wget_footer(
+            &uri("https://github.com/"),
+            None,
+            None,
+            Some("https://gitlab.com"),
+        )
+        .into();
+        let expected = to_html("-H -P 'github.com' 'https://github.com");
+        assert_eq!(to_be_tested, expected);
+    }
+
+    #[test]
+    fn test_rm_form_strips_prefix() {
+        let rm_route = "/rm";
+        let prefix = "/prefix";
+        let encoded_path = "/prefix/some/path/file.txt";
+
+        let html = rm_form(rm_route, encoded_path, prefix);
+        let expected_action = r#"action="/rm?path=/some/path/file.txt""#;
+
+        assert!(
+            html.0.contains(expected_action),
+            "Actual HTML: {}\nExpected to contain: {}",
+            html.0,
+            expected_action
+        )
     }
 }

@@ -1,10 +1,8 @@
 use anyhow::Result;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
-use axum::http::HeaderMap;
-use axum::middleware::{from_fn, from_fn_with_state};
-use axum::response::Response;
-use axum::routing::{get, post};
+use axum::extract::DefaultBodyLimit;
+use axum::middleware::from_fn_with_state;
+use axum::routing::{any, get, post};
 use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use fast_qr::QRBuilder;
@@ -12,18 +10,17 @@ use log::{error, warn};
 use miniserve_axum::basic_auth_guard;
 use miniserve_axum::error_page::error_page_middleware;
 use miniserve_axum::{
-    CliArgs, FileOpQueryParameters, MiniserveConfig, QR_EC_LEVEL, StartupError, api,
-    configure_header, css, favicon, file_and_directory_handler, healthcheck, log_error_chain,
-    upload_file_handler,
+    CliArgs, LogColor, MiniserveConfig, QR_EC_LEVEL, StartupError, api, configure_header, css,
+    favicon, healthcheck, log_error_chain, rm_file_handler, serve_handler, upload_file_handler,
 };
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::{future::Future, pin::Pin};
 use std::{
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
 };
-use tokio::net::TcpListener;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
 fn main() -> Result<()> {
@@ -52,25 +49,41 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
+fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(miniserve_config.workers.max(1))
+        .enable_all()
+        .build()
+        .map_err(|e| StartupError::IoError("Failed to create runtime".into(), e))?;
+    runtime.block_on(run_server(miniserve_config))
+}
+
+async fn run_server(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
     let log_level = if miniserve_config.verbose {
         simplelog::LevelFilter::Info
     } else {
         simplelog::LevelFilter::Warn
     };
 
+    let color_choice = match miniserve_config.log_color {
+        LogColor::Auto if io::stdout().is_terminal() => simplelog::ColorChoice::Auto,
+        LogColor::Always => {
+            colored::control::SHOULD_COLORIZE.set_override(true);
+            simplelog::ColorChoice::Always
+        }
+        LogColor::Never => {
+            colored::control::SHOULD_COLORIZE.set_override(false);
+            simplelog::ColorChoice::Never
+        }
+        LogColor::Auto => simplelog::ColorChoice::Never,
+    };
     simplelog::TermLogger::init(
         log_level,
         simplelog::ConfigBuilder::new()
             .set_time_format_rfc2822()
             .build(),
         simplelog::TerminalMode::Mixed,
-        if io::stdout().is_terminal() {
-            simplelog::ColorChoice::Auto
-        } else {
-            simplelog::ColorChoice::Never
-        },
+        color_choice,
     )
     .or_else(|_| simplelog::SimpleLogger::init(log_level, simplelog::Config::default()))
     .expect("Couldn't initialize logger");
@@ -95,22 +108,25 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         .map_err(|e| StartupError::IoError("Failed to resolve path to be served".to_string(), e))?;
 
     // warn if --index is specified but not found
-    if let Some(ref index) = miniserve_config.index {
-        if !canon_path.join(index).exists() {
-            warn!(
-                "The file '{}' provided for option --index could not be found.",
-                index.to_string_lossy(),
-            );
-        }
+    if let Some(ref index) = miniserve_config.index
+        && !canon_path.join(index).exists()
+        && !miniserve_config.quiet
+    {
+        warn!(
+            "The file '{}' provided for option --index could not be found.",
+            index.to_string_lossy(),
+        );
     }
 
     let path_string = canon_path.to_string_lossy();
 
-    println!(
-        "{name} v{version}",
-        name = "miniserve".bold(),
-        version = crate_version!()
-    );
+    if !miniserve_config.quiet {
+        println!(
+            "{name} v{version}",
+            name = "miniserve".bold(),
+            version = crate_version!()
+        );
+    }
     if !miniserve_config.path_explicitly_chosen {
         // If the path to serve has NOT been explicitly chosen and if this is NOT an interactive
         // terminal, we should refuse to start for security reasons. This would be the case when
@@ -120,22 +136,24 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
             return Err(StartupError::NoExplicitPathAndNoTerminal);
         }
 
-        warn!(
-            "miniserve has been invoked without an explicit path so it will serve the current directory after a short delay."
-        );
-        warn!(
-            "Invoke with -h|--help to see options or invoke as `miniserve .` to hide this advice."
-        );
-        print!("Starting server in ");
-        io::stdout()
-            .flush()
-            .map_err(|e| StartupError::IoError("Failed to write data".to_string(), e))?;
-        for c in "3… 2… 1… \n".chars() {
-            print!("{c}");
+        if !miniserve_config.quiet {
+            warn!(
+                "miniserve has been invoked without an explicit path so it will serve the current directory after a short delay."
+            );
+            warn!(
+                "Invoke with -h|--help to see options or invoke as `miniserve .` to hide this advice."
+            );
+            print!("Starting server in ");
             io::stdout()
                 .flush()
                 .map_err(|e| StartupError::IoError("Failed to write data".to_string(), e))?;
-            thread::sleep(Duration::from_millis(500));
+            for c in "3… 2… 1… \n".chars() {
+                print!("{c}");
+                io::stdout()
+                    .flush()
+                    .map_err(|e| StartupError::IoError("Failed to write data".to_string(), e))?;
+                thread::sleep(Duration::from_millis(500));
+            }
         }
     }
 
@@ -189,48 +207,52 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
 
     // Public routes
     let base_app = Router::<Arc<MiniserveConfig>>::new()
-        .layer(TraceLayer::new_for_http())
-        .layer(tower::ServiceBuilder::new().layer(CompressionLayer::new()))
-        .layer(from_fn_with_state(inside_config.clone(), configure_header))
-        .layer(from_fn(error_page_middleware))
         .route(&inside_config.healthcheck_route, get(healthcheck))
         .route(&inside_config.favicon_route, get(favicon))
         .route(&inside_config.css_route, get(css))
         .route(&inside_config.api_route, post(api));
 
     // Protected content
-    let protected = Router::<Arc<MiniserveConfig>>::new()
-        .route(
-            "/upload",
-            post(|state, query, headers, multipart| async move {
-                upload_route_handler(state, query, headers, multipart).await
-            }),
-        )
-        .fallback(file_and_directory_handler)
-        .layer(from_fn_with_state(inside_config.clone(), basic_auth_guard));
-
-    // Use merge for empty prefix, nest otherwise
-    let app = if inside_config.route_prefix.is_empty() {
-        base_app.merge(protected)
-    } else {
-        base_app.nest(&inside_config.route_prefix, protected)
+    let prefix = &inside_config.route_prefix;
+    let mut protected = Router::<Arc<MiniserveConfig>>::new()
+        .route(&format!("{prefix}/upload"), post(upload_file_handler))
+        .route(&format!("{prefix}/rm"), post(rm_file_handler))
+        .route(&format!("{prefix}/"), any(serve_handler))
+        .route(&format!("{prefix}/{{*path}}"), any(serve_handler));
+    if !prefix.is_empty() {
+        protected = protected.route(prefix, any(serve_handler));
     }
-    .with_state(inside_config)
-    // Allow large file uploads by disabling Axum's default 2MB body limit
-    .layer(DefaultBodyLimit::disable());
+    let protected = protected.layer(from_fn_with_state(inside_config.clone(), basic_auth_guard));
 
-    println!("Bound to {}", display_sockets.join(", "));
+    let mut app = base_app
+        .merge(protected)
+        .layer(from_fn_with_state(
+            inside_config.clone(),
+            error_page_middleware,
+        ))
+        .layer(from_fn_with_state(inside_config.clone(), configure_header))
+        .layer(TraceLayer::new_for_http())
+        .with_state(inside_config)
+        // Allow large file uploads by disabling Axum's default 2MB body limit
+        .layer(DefaultBodyLimit::disable());
+    if miniserve_config.compress_response {
+        app = app.layer(CompressionLayer::new());
+    }
 
-    println!("Serving path {}", path_string.yellow().bold());
+    if !miniserve_config.quiet {
+        println!("Bound to {}", display_sockets.join(", "));
 
-    println!(
-        "Available at (non-exhaustive list):\n    {}\n",
-        display_urls
-            .iter()
-            .map(|url| url.green().bold().to_string())
-            .collect::<Vec<_>>()
-            .join("\n    "),
-    );
+        println!("Serving path {}", path_string.yellow().bold());
+
+        println!(
+            "Available at (non-exhaustive list):\n    {}\n",
+            display_urls
+                .iter()
+                .map(|url| url.green().bold().to_string())
+                .collect::<Vec<_>>()
+                .join("\n    "),
+        );
+    }
 
     // print QR code to terminal
     if miniserve_config.show_qrcode && io::stdout().is_terminal() {
@@ -250,26 +272,47 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         }
     }
 
-    if io::stdout().is_terminal() {
+    if !miniserve_config.quiet && io::stdout().is_terminal() {
         println!("Quit by pressing CTRL-C");
     }
 
-    let addr = format!("0.0.0.0:{}", miniserve_config.port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .map_err(|e| StartupError::NetworkError(e.to_string()))?;
-    axum::serve(listener, app.into_make_service())
+    let mut servers: Vec<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>> = Vec::new();
+    for address in socket_addresses {
+        let listener = create_tcp_listener(address)
+            .map_err(|e| StartupError::IoError(format!("Failed to bind server to {address}"), e))?;
+        let router = app.clone();
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &miniserve_config.tls_rustls_config {
+            let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls.clone()));
+            servers.push(Box::pin(async move {
+                axum_server::from_tcp_rustls(listener, tls)
+                    .serve(router.into_make_service())
+                    .await
+            }));
+            continue;
+        }
+        servers.push(Box::pin(async move {
+            axum_server::from_tcp(listener)
+                .serve(router.into_make_service())
+                .await
+        }));
+    }
+    futures::future::try_join_all(servers)
         .await
         .map_err(|e| StartupError::NetworkError(e.to_string()))?;
 
     Ok(())
 }
 
-async fn upload_route_handler(
-    state: State<Arc<MiniserveConfig>>,
-    query: Query<FileOpQueryParameters>,
-    headers: HeaderMap,
-    multipart: Multipart,
-) -> Response {
-    upload_file_handler(state, query, headers, multipart).await
+fn create_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }

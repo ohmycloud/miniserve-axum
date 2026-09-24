@@ -206,7 +206,7 @@ where
         write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let mut paths_queue: Vec<PathBuf> = vec![directory.to_path_buf()];
     let zip_root_folder_name = directory.file_name().unwrap_or_else(|| {
-        // If file_name() returns None (e.g., for root paths), use a default name  
+        // If file_name() returns None (e.g., for root paths), use a default name
         std::ffi::OsStr::new("archive")
     });
 

@@ -3,6 +3,14 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(unix)]
+pub fn get_default_filemode() -> u16 {
+    use rustix::{fs::Mode, process::umask};
+    let previous = umask(Mode::all());
+    umask(previous);
+    (0o666 & (!previous).as_raw_mode()) as u16
+}
+
 /// Guarantee that the path is relative and cannot traverse back to parent directories
 /// and optionally prevent traversing hidden directories.
 ///

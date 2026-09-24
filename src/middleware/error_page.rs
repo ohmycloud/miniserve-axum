@@ -1,116 +1,54 @@
-use std::{str::FromStr, usize};
+use std::{str::FromStr, sync::Arc};
 
 use axum::{
-    extract::Request,
-    http::{HeaderValue, StatusCode, header},
+    body::{Body, to_bytes},
+    extract::{Request, State},
+    http::{HeaderValue, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
-use tower::Service;
 
-fn generate_error_page(status: StatusCode, error_message: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Error {}</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 50px auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }}
-        .error-container {{
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        .error-code {{
-            font-size: 48px;
-            font-weight: bold;
-            color: #e74c3c;
-            margin-bottom: 10px;
-        }}
-        .error-title {{
-            font-size: 24px;
-            color: #333;
-            margin-bottom: 20px;
-        }}
-        .error-message {{
-            color: #666;
-            line-height: 1.5;
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 4px;
-            border-left: 4px solid #e74c3c;
-        }}
-    </style>
-</head>
-<body>
-    <div class="error-container">
-        <div class="error-code">{}</div>
-        <div class="error-title">{}</div>
-        <div class="error-message">{}</div>
-    </div>
-</body>
-</html>"#,
-        status.as_u16(),
-        status.as_u16(),
-        status.canonical_reason().unwrap_or("Error"),
-        html_escape(error_message)
-    )
-}
+use crate::{MiniserveConfig, render_error};
 
-fn html_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
-}
-
-pub async fn error_page_middleware(req: Request, mut next: Next) -> Response {
-    let uri_path = req.uri().path().to_string();
-    let res = next.call(req).await.unwrap();
-    if (res.status().is_client_error() || res.status().is_server_error())
-        && uri_path != "/upload"
-        && res
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .map(AsRef::as_ref)
-            .and_then(|s| std::str::from_utf8(s).ok())
-            .and_then(|s| mime::Mime::from_str(s).ok())
-            .as_ref()
-            .map(mime::Mime::essence_str)
-            == Some(mime::TEXT_PLAIN.as_ref())
+pub async fn error_page_middleware(
+    State(config): State<Arc<MiniserveConfig>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    let return_address = request
+        .headers()
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("/")
+        .to_owned();
+    let response = next.run(request).await;
+    let is_text = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| mime::Mime::from_str(v).ok())
+        .is_none_or(|v| v.essence_str() == mime::TEXT_PLAIN.as_ref());
+    if !(response.status().is_client_error() || response.status().is_server_error())
+        || path.ends_with("/upload")
+        || !is_text
     {
-        let status = res.status();
-        let (_parts, body) = res.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to response body")
-                    .into_response();
-            }
-        };
-
-        let error_message = String::from_utf8_lossy(&body_bytes);
-        let html_content = generate_error_page(status, &error_message);
-        let mut response = html_content.into_response();
-        *response.status_mut() = status;
-
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        );
-
-        response
-    } else {
-        res
+        return response;
     }
+    let status = response.status();
+    let (mut parts, body) = response.into_parts();
+    let bytes = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+    let message = if bytes.is_empty() {
+        status.to_string()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    Response::from_parts(
+        parts,
+        Body::from(render_error(&message, status, &config, &return_address).into_string()),
+    )
 }

@@ -8,9 +8,11 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use axum::http::HeaderMap;
 
+#[cfg(unix)]
+use crate::file_utils::get_default_filemode;
 use crate::{
-    CliArgs, MediaType, RequiredAuth, SizeDisplay, SortingMethod, SortingOrder, ThemeSlug,
-    parse_auth, sanitize_path,
+    CliArgs, DuplicateFile, LogColor, MediaType, RequiredAuth, SizeDisplay, SortingMethod,
+    SortingOrder, ThemeSlug, parse_auth, sanitize_path,
 };
 
 #[cfg(feature = "tls")]
@@ -25,6 +27,7 @@ const ROUTE_ALPHABET: [char; 16] = [
 pub struct MiniserveConfig {
     /// Enable verbose mode
     pub verbose: bool,
+    pub quiet: bool,
 
     /// Path to be served by miniserve
     pub path: std::path::PathBuf,
@@ -37,6 +40,7 @@ pub struct MiniserveConfig {
 
     /// Ip address(es) on which miniserve will be available
     pub interfaces: Vec<IpAddr>,
+    pub workers: usize,
 
     /// Enable HTTP basic authentication
     pub auth: Vec<RequiredAuth>,
@@ -108,18 +112,23 @@ pub struct MiniserveConfig {
 
     /// Enable file upload
     pub file_upload: bool,
+    pub pastebin_enabled: bool,
 
     /// Max amount of concurrency when uploading multiple files
     pub web_upload_concurrency: usize,
 
     /// List of allowed upload directories
     pub allowed_upload_dir: Vec<String>,
+    #[cfg(unix)]
+    pub upload_chmod: u16,
 
     /// HTML accept attribute value
     pub uploadable_media_type: Option<String>,
 
     /// Enable upload to override existing files
-    pub overwrite_files: bool,
+    pub on_duplicate_files: DuplicateFile,
+    pub rm_enabled: bool,
+    pub allowed_rm_dir: Vec<String>,
 
     /// If false, creation of uncompressed tar archives is disabled
     pub tar_enabled: bool,
@@ -165,6 +174,8 @@ pub struct MiniserveConfig {
 
     /// If enabled, will show in exact byte size of the file
     pub show_exact_bytes: bool,
+    pub file_external_url: Option<String>,
+    pub log_color: LogColor,
 
     /// If set, use provided rustls config for TLS
     #[cfg(feature = "tls")]
@@ -228,6 +239,9 @@ impl MiniserveConfig {
         #[cfg(feature = "tls")]
         let tls_rustls_server_config =
             if let (Some(tls_cert), Some(tls_key)) = (args.tls_cert, args.tls_key) {
+                if rustls::crypto::CryptoProvider::get_default().is_none() {
+                    let _ = rustls::crypto::ring::default_provider().install_default();
+                }
                 let cert_file = &mut BufReader::new(
                     File::open(&tls_cert)
                         .context(format!("Couldn't access TLS certificate {tls_cert:?}"))?,
@@ -281,6 +295,21 @@ impl MiniserveConfig {
             .transpose()?
             .unwrap_or_default();
 
+        let allowed_rm_dir = args
+            .allowed_rm_dir
+            .as_ref()
+            .map(|v| {
+                v.iter()
+                    .map(|p| {
+                        sanitize_path(p, args.hidden)
+                            .map(|p| p.display().to_string().replace('\\', "/"))
+                            .ok_or(anyhow!("Illegal path {p:?}"))
+                    })
+                    .collect()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         let show_exact_bytes = match args.size_display {
             SizeDisplay::Human => false,
             SizeDisplay::Exact => true,
@@ -288,10 +317,12 @@ impl MiniserveConfig {
 
         Ok(Self {
             verbose: args.verbose,
+            quiet: args.quiet,
             path: args.path.unwrap_or_else(|| PathBuf::from(".")),
             temp_upload_directory: args.temp_upload_directory,
             port,
             interfaces,
+            workers: args.workers,
             auth,
             path_explicitly_chosen,
             no_symlinks: args.no_symlinks,
@@ -308,14 +339,19 @@ impl MiniserveConfig {
             index: args.index,
             spa: args.spa,
             pretty_urls: args.pretty_urls,
-            overwrite_files: args.overwrite_files,
+            on_duplicate_files: args.on_duplicate_files,
             show_qrcode: args.qrcode,
             directory_size: args.directory_size,
             mkdir_enabled: args.mkdir_enabled,
             file_upload: args.allowed_upload_dir.is_some(),
+            pastebin_enabled: args.pastebin_enabled,
             web_upload_concurrency: args.web_upload_concurrency,
             allowed_upload_dir,
+            #[cfg(unix)]
+            upload_chmod: args.chmod.unwrap_or_else(get_default_filemode),
             uploadable_media_type,
+            rm_enabled: args.allowed_rm_dir.is_some(),
+            allowed_rm_dir,
             tar_enabled: args.enable_tar,
             tar_gz_enabled: args.enable_tar_gz,
             zip_enabled: args.enable_zip,
@@ -332,6 +368,8 @@ impl MiniserveConfig {
             tls_rustls_config: tls_rustls_server_config,
             compress_response: args.compress_response,
             show_exact_bytes,
+            file_external_url: args.file_external_url,
+            log_color: args.log_color,
         })
     }
 }

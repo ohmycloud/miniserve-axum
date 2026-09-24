@@ -12,6 +12,10 @@ pub struct CliArgs {
     #[arg(short = 'v', long = "verbose", env = "MINISERVE_VERBOSE")]
     pub verbose: bool,
 
+    /// Reduce output and silence warnings
+    #[arg(long, env = "MINISERVE_QUIET")]
+    pub quiet: bool,
+
     /// Which path to serve
     #[arg(value_hint = ValueHint::AnyPath, env = "MINISERVE_PATH")]
     pub path: Option<PathBuf>,
@@ -72,6 +76,10 @@ pub struct CliArgs {
     )]
     pub interfaces: Vec<IpAddr>,
 
+    /// Number of server workers
+    #[arg(long, default_value = "4", env = "MINISERVE_WORKERS")]
+    pub workers: usize,
+
     /// Set authentication
     ///
     /// Currently supported formats:
@@ -129,7 +137,7 @@ pub struct CliArgs {
 
     /// Default sorting order for file list
     #[arg(
-        short = '0',
+        short = 'O',
         long = "default-sorting-order",
         default_value = "desc",
         ignore_case = true,
@@ -173,7 +181,7 @@ pub struct CliArgs {
         value_hint = ValueHint::FilePath,
         num_args(0..=1),
         value_delimiter(','),
-        env = "MINISERVE_ALLOWD_UPLOAD_DIR"
+        env = "MINISERVE_ALLOWED_UPLOAD_DIR"
     )]
     pub allowed_upload_dir: Option<Vec<PathBuf>>,
 
@@ -197,6 +205,16 @@ pub struct CliArgs {
     )]
     pub web_upload_concurrency: usize,
 
+    /// Set Unix file permissions of uploaded files (octal, for example 0600)
+    #[cfg(unix)]
+    #[arg(
+        long,
+        value_parser(parse_file_mode),
+        env = "MINISERVE_CHMOD",
+        requires = "allowed_upload_dir"
+    )]
+    pub chmod: Option<u16>,
+
     /// Enable recursive directory size calculation
     ///
     /// This is disabled by default because it is a potentially fairly IO intensive operation.
@@ -211,6 +229,14 @@ pub struct CliArgs {
         env = "MINISERVE_MKDIR_ENABLED"
     )]
     pub mkdir_enabled: bool,
+
+    /// Enable creating plaintext pastes
+    #[arg(
+        long = "pastebin",
+        requires = "allowed_upload_dir",
+        env = "MINISERVE_PASTEBIN_ENABLED"
+    )]
+    pub pastebin_enabled: bool,
 
     /// Specity uploadable media types
     #[arg(
@@ -230,13 +256,18 @@ pub struct CliArgs {
     )]
     pub media_type_raw: Option<String>,
 
-    /// Enable overriding existing files during file upload
+    /// What to do if a file of the same name already exists during upload
     #[arg(
         short = 'o',
-        long = "overwrite-files",
-        env = "MINISERVE_OVERWRITE_FILES"
+        long = "on-duplicate-files",
+        env = "MINISERVE_ON_DUPLICATE_FILES",
+        default_value = "error"
     )]
-    pub overwrite_files: bool,
+    pub on_duplicate_files: DuplicateFile,
+
+    /// Enable file and directory deletion, optionally restricted to directories
+    #[arg(short = 'R', long = "rm-files", value_hint = ValueHint::DirPath, num_args(0..=1), value_delimiter(','), env = "MINISERVE_ALLOWED_RM_DIR")]
+    pub allowed_rm_dir: Option<Vec<PathBuf>>,
 
     /// Enable uncompressed tar archive generation
     #[arg(short = 'r', long = "enable-tar", env = "MINISERVE_ENABLE_TAR")]
@@ -344,12 +375,20 @@ pub struct CliArgs {
     /// Enable read-only WebDAV support (PROPFIND requests)
     ///
     /// Currently incompatible with -P|--no-symlinks (see https://github.com/messense/dav-server-rs/issues/37)
-    #[arg(long, env = "MINISERVE_ENABLE_WEBDAV", conflicts_with = "no_symlinks")]
+    #[arg(long, env = "MINISERVE_ENABLE_WEBDAV")]
     pub enable_webdav: bool,
 
     /// Show served file size in exact bytes
     #[arg(long, default_value_t = SizeDisplay::Human, env = "MINISERVE_SIZE_DISPLAY")]
     pub size_display: SizeDisplay,
+
+    /// External URL prepended to file links in listings
+    #[arg(long, env = "MINISERVE_FILE_EXTERNAL_URL")]
+    pub file_external_url: Option<String>,
+
+    /// Color style of log output
+    #[arg(long, env = "MINISERVE_LOG_COLOR", default_value = "auto")]
+    pub log_color: LogColor,
 }
 
 // Validate that a path passed in is a directory and it exists.
@@ -378,6 +417,27 @@ pub enum MediaType {
     Video,
 }
 
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum DuplicateFile {
+    #[default]
+    Error,
+    Overwrite,
+    Rename,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum LogColor {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[cfg(unix)]
+fn parse_file_mode(src: &str) -> Result<u16, std::num::ParseIntError> {
+    u16::from_str_radix(src, 8)
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 pub enum SizeDisplay {
     Human,
@@ -400,13 +460,13 @@ fn parse_header(src: &str) -> Result<HeaderMap, httparse::Error> {
     httparse::parse_headers(header.as_bytes(), &mut headers)?;
 
     let mut header_map = HeaderMap::new();
-    if let Some(h) = headers.first() {
-        if h.name != httparse::EMPTY_HEADER.name {
-            header_map.insert(
-                HeaderName::from_bytes(h.name.as_bytes()).unwrap(),
-                HeaderValue::from_bytes(h.value).unwrap(),
-            );
-        }
+    if let Some(h) = headers.first()
+        && h.name != httparse::EMPTY_HEADER.name
+    {
+        header_map.insert(
+            HeaderName::from_bytes(h.name.as_bytes()).unwrap(),
+            HeaderValue::from_bytes(h.value).unwrap(),
+        );
     }
     Ok(header_map)
 }
